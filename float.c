@@ -260,14 +260,22 @@ static inline isize float_format(
     };
 
     // [decimal mantissa] * (10 ^ decimal_exponent)
+    // The order is from the most significant digits to the least significant ones.
     i8 *decimal_mantissa = (i8 *)arena.begin;
     isize decimal_mantissa_size = 0;
     isize decimal_mantissa_capacity = arena.end - arena.begin;
     isize decimal_exponent = 0;
 
+    // Allocate an additional digit in case we overflow when rounding up.
+    assert(decimal_mantissa_capacity > 0);
+    decimal_mantissa[0] = 0;
+    decimal_mantissa_size += 1;
+
     // Put the integer part into the decimal mantissa.
     {
-        while (!number_is_zero(integer_part)) {
+        i8 *decimal_integer_part_begin = decimal_mantissa + decimal_mantissa_size;
+
+        do {
             u32 remainder;
             number_divide(integer_part, 10, integer_part_swap, &remainder);
 
@@ -278,9 +286,9 @@ static inline isize float_format(
             Number swap = integer_part_swap;
             integer_part_swap = integer_part;
             integer_part = swap;
-        }
+        } while (!number_is_zero(integer_part));
 
-        bytes_reverse(decimal_mantissa, decimal_mantissa + decimal_mantissa_size);
+        bytes_reverse(decimal_integer_part_begin, decimal_mantissa + decimal_mantissa_size);
     }
 
     // Put the fractional part into the decimal mantissa.
@@ -321,34 +329,127 @@ static inline isize float_format(
     // Actually "allocate" the decimal mantissa within the arena.
     arena.begin += decimal_mantissa_size;
 
-    i8 *decimal_mantissa_iter = decimal_mantissa;
+    enum {
+        ROUND_UP,
+        ROUND_DOWN,
+        ROUND_TO_EVEN,
+    } rounding;
+
+    // The first non-zero digit of the decimal mantissa.
+    i8 *decimal_mantissa_begin = decimal_mantissa;
     i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
+    while (decimal_mantissa_begin < decimal_mantissa_end && *decimal_mantissa_begin == 0) {
+        decimal_mantissa_begin += 1;
+    }
+
+    i8 last_significant_digit = 0;
+    i8 rounding_digit = 0;
+    {
+        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
+
+        if (decimal_mantissa_iter < decimal_mantissa_end) {
+            isize precision_left = params->precision;
+
+            rounding_digit = *decimal_mantissa_iter;
+            decimal_mantissa_iter += 1;
+
+            while (precision_left > 0) {
+                last_significant_digit = rounding_digit;
+
+                if (decimal_mantissa_iter < decimal_mantissa_end) {
+                    rounding_digit = *decimal_mantissa_iter;
+                } else {
+                    rounding_digit = 0;
+                }
+
+                decimal_mantissa_iter += 1;
+                precision_left -= 1;
+            }
+        }
+    }
+
+    if (rounding_digit < 5) {
+        rounding = ROUND_DOWN;
+    } else if (rounding_digit > 5) {
+        rounding = ROUND_UP;
+    } else {
+        rounding = ROUND_TO_EVEN;
+
+        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
+        i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
+
+        // Skip past the rounding digit.
+        decimal_mantissa_iter += params->precision + 1;
+        while (decimal_mantissa_iter < decimal_mantissa_end) {
+            if (*decimal_mantissa_iter > 0) {
+                rounding = ROUND_UP;
+                break;
+            }
+
+            decimal_mantissa_iter += 1;
+        }
+    }
+
+    if (rounding == ROUND_UP || rounding == ROUND_TO_EVEN && last_significant_digit % 2 == 1) {
+        i8 overflow = 1;
+
+        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
+        i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
+
+        decimal_mantissa_iter += params->precision - 1;
+        while (decimal_mantissa_iter >= decimal_mantissa) {
+            i8 intermediate_sum = overflow + *decimal_mantissa_iter;
+            *decimal_mantissa_iter = intermediate_sum % 10;
+            overflow = intermediate_sum / 10;
+
+            decimal_mantissa_iter -= 1;
+        }
+
+        // Recalculate position of the first non-zero mantissa digit, because an overflow could have
+        // happened during the rounding.
+        decimal_mantissa_begin = decimal_mantissa;
+        while (decimal_mantissa_begin < decimal_mantissa_end && *decimal_mantissa_begin == 0) {
+            decimal_mantissa_begin += 1;
+        }
+    }
+
+    i8 *decimal_mantissa_iter = decimal_mantissa_begin;
+    isize precision_left = params->precision;
 
     // Print the first digit and the decimal point:
     if (decimal_mantissa_iter < decimal_mantissa_end) {
         string_writer_push_char(&string_writer, '0' + *decimal_mantissa_iter);
         decimal_mantissa_iter += 1;
+        precision_left -= 1;
     } else {
         string_writer_push_char(&string_writer, '0');
     }
+
     string_writer_push_char(&string_writer, '.');
 
-    // Print the rest of the digits:
-    if (decimal_mantissa_iter < decimal_mantissa_end) {
-        while (decimal_mantissa_iter < decimal_mantissa_end) {
-            string_writer_push_char(&string_writer, '0' + *decimal_mantissa_iter);
-            decimal_mantissa_iter += 1;
+    if (precision_left > 0) {
+        while (precision_left > 0) {
+            if (decimal_mantissa_iter < decimal_mantissa_end) {
+                string_writer_push_char(&string_writer, '0' + *decimal_mantissa_iter);
+                decimal_mantissa_iter += 1;
+            } else {
+                string_writer_push_char(&string_writer, '0');
+            }
+
+            precision_left -= 1;
         }
     } else {
         string_writer_push_char(&string_writer, '0');
     }
 
     // Print the adjusted exponent:
-    string_writer_push_char(&string_writer, 'e');
-    string_writer_push_int(
-        &string_writer,
-        decimal_exponent + isize_max(decimal_mantissa_size - 1, 0)
-    );
+    {
+        string_writer_push_char(&string_writer, 'e');
+        string_writer_push_int(
+            &string_writer,
+            decimal_exponent + isize_max(decimal_mantissa_end - decimal_mantissa_begin, 1) - 1
+        );
+    }
 
     string_writer_push_char(&string_writer, '\0');
     return string_writer.chars_written;
@@ -394,6 +495,10 @@ isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams c
         // Subnormals and zero.
         exponent = -126 - mantissa_bits;
         mantissa = raw_value & mantissa_mask;
+
+        if (mantissa == 0) {
+            exponent = 0;
+        }
     } else {
         // Normal floats (with an implicit one).
         exponent = raw_exponent - 127 - mantissa_bits;
@@ -455,6 +560,10 @@ isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams c
         // Subnormals and zero.
         exponent = -1022 - mantissa_bits;
         mantissa = raw_value & mantissa_mask;
+
+        if (mantissa == 0) {
+            exponent = 0;
+        }
     } else {
         // Normal floats.
         exponent = raw_exponent - 1023 - mantissa_bits;

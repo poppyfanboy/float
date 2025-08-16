@@ -30,17 +30,40 @@
 #endif
 
 typedef struct {
+    void *user_data;
+    void *(*alloc)(isize size, void *user_data);
+    void(*dealloc)(void *ptr, isize size, void *user_data);
+} FloatLibAllocator;
+
+#ifdef FLOAT_LIB_USE_DEFAULT_ALLOCATOR
+    #include <stdlib.h> // malloc, free
+    #include <stddef.h> // NULL
+
+    static inline void *float_lib_default_alloc(isize size, void *user_data) {
+        return malloc(size);
+    }
+
+    static inline void float_lib_default_dealloc(void *ptr, isize size, void *user_data) {
+        free(ptr);
+    }
+
+    #define FLOAT_LIB_DEFAULT_ALLOCATOR &(FloatLibAllocator){   \
+        .user_data = NULL,                                      \
+        .alloc = float_lib_default_alloc,                       \
+        .dealloc = float_lib_default_dealloc,                   \
+    }
+#endif
+
+typedef struct {
     isize precision;
 } FloatFormatParams;
 
-bool is_f32(char const *string, isize string_size);
-f32 f32_parse(char const *string, isize string_size);
+// You can pass -1 as string size in case the string is null-terminated.
+bool string_is_float(char const *string, isize string_size);
+f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator);
+f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator);
 
 isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams const *params);
-
-bool is_f64(char const *string, isize string_size);
-f64 f64_parse(char const *string, isize string_size);
-
 isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams const *params);
 
 #endif // FLOAT_H

@@ -9,10 +9,10 @@
 
 #include "float.h"
 
-#include <string.h> // memcpy, memset
+#include <string.h> // memcpy, memset, strncmp
 #include <assert.h> // assert
 
-static isize isize_max(isize left, isize right) {
+static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
 
@@ -24,11 +24,16 @@ typedef struct {
 } Arena;
 
 static void *arena_alloc(Arena *arena, isize size) {
+    if (size == 0) {
+        return NULL;
+    }
+
     isize padding = (~(uptr)arena->begin + 1) & (ARENA_ALIGNMENT - 1);
     assert(arena->begin + padding + size <= arena->end);
 
     void *ptr = arena->begin + padding;
     arena->begin += padding + size;
+
     return ptr;
 }
 
@@ -56,6 +61,13 @@ typedef struct {
         .data = string_literal,             \
         .size = sizeof(string_literal) - 1, \
     }
+
+static inline StringView sv_range(char const *begin, char const *end) {
+    return (StringView){
+        .data = begin,
+        .size = end - begin,
+    };
+}
 
 // Writes data into the dest buffer if it is not null. Otherwise, counts how many chars would have
 // been written into the buffer, if there was one.
@@ -95,7 +107,7 @@ static void string_writer_push_int(StringWriter *string_writer, isize integer) {
     // Iterate at least once to cover the case of integer equal to 0.
     do {
         // I stole this idea from here: https://stackoverflow.com/a/23840699
-        *decimal_iter = ("9876543210123456789")[9 + (integer % 10)];
+        *decimal_iter = ("987654321" "0" "123456789")[9 + (integer % 10)];
 
         integer /= 10;
         decimal_iter += 1;
@@ -118,6 +130,9 @@ static void string_writer_push_int(StringWriter *string_writer, isize integer) {
 
 // A multi-word unsigned integer number.
 // The data is in "little-endian" order, meaning that data[0] is the least significant digit.
+//
+// One nice thing about the "little-endian" order is that you can easily realloc the digits array to
+// allow for storing larger numbers.
 typedef struct {
     u32 *data;
     isize size;
@@ -171,21 +186,26 @@ static void number_multiply(Number multiplicand, u32 multiplier, Number product,
     *overflow = intermediate_overflow;
 }
 
+#define INFINITY_LITERAL "inf"
+#define NAN_LITERAL "nan"
+
 // Represents a value of: (is_negative ? -1 : 1) * mantissa * (2 ^ exponent)
 typedef struct {
     bool is_negative;
     isize exponent;
     Number mantissa;
-} Float;
+} FloatParts;
 
 static inline isize float_format(
-    Float value,
+    FloatParts float_parts,
     char *string, isize string_size,
     FloatFormatParams const *params,
     Arena arena
 ) {
-    isize integer_part_size = isize_max((value.mantissa.size * 32 + value.exponent + 31) / 32, 0);
-    isize fractional_part_size = isize_max((0 - value.exponent + 31) / 32, 0);
+    isize integer_part_size =
+        isize_max((float_parts.mantissa.size * 32 + float_parts.exponent + 31) / 32, 0);
+    isize fractional_part_size =
+        isize_max((0 - float_parts.exponent + 31) / 32, 0);
 
     u32 *fixed = arena_alloc(&arena, (integer_part_size + fractional_part_size) * sizeof(u32));
     memset(fixed, 0, (integer_part_size + fractional_part_size) * sizeof(u32));
@@ -211,15 +231,15 @@ static inline isize float_format(
         u32 *fixed_end = fixed + integer_part_size + fractional_part_size;
 
         // Skip the zeros of the integer part, when the exponent is large:
-        if (value.exponent >= 32) {
-            fixed_iter += value.exponent / 32;
+        if (float_parts.exponent >= 32) {
+            fixed_iter += float_parts.exponent / 32;
         }
 
-        u32 *mantissa_iter = value.mantissa.data;
-        u32 *mantissa_end = value.mantissa.data + value.mantissa.size;
+        u32 *mantissa_iter = float_parts.mantissa.data;
+        u32 *mantissa_end = float_parts.mantissa.data + float_parts.mantissa.size;
 
         u32 carry = 0;
-        int bit_shift = ((value.exponent % 32) + 32) % 32;
+        int bit_shift = ((float_parts.exponent % 32) + 32) % 32;
 
         // Copy mantissa digits starting from the least significant ones:
         while (fixed_iter != fixed_end) {
@@ -245,7 +265,7 @@ static inline isize float_format(
         .chars_written = 0,
     };
 
-    if (value.is_negative) {
+    if (float_parts.is_negative) {
         string_writer_push_char(&string_writer, '-');
     }
 
@@ -457,7 +477,7 @@ static inline isize float_format(
 
 isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams const *params) {
     u32 raw_value;
-    memcpy(&raw_value, &value, 4);
+    memcpy(&raw_value, &value, sizeof(raw_value));
 
     bool is_negative = (raw_value & 0x80000000) != 0;
     raw_value &= 0x7fffffff;
@@ -480,9 +500,9 @@ isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams c
             if (is_negative) {
                 string_writer_push_char(&string_writer, '-');
             }
-            string_writer_push_string(&string_writer, SV("inf"));
+            string_writer_push_string(&string_writer, SV(INFINITY_LITERAL));
         } else {
-            string_writer_push_string(&string_writer, SV("nan"));
+            string_writer_push_string(&string_writer, SV(NAN_LITERAL));
         }
         string_writer_push_char(&string_writer, '\0');
 
@@ -513,7 +533,11 @@ isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams c
     };
 
     return float_format(
-        (Float){is_negative, exponent, (Number){(u32[]){mantissa}, 1}},
+        (FloatParts){
+            is_negative,
+            exponent,
+            (Number){(u32[]){mantissa}, 1},
+        },
         string, string_size,
         params,
         arena
@@ -522,7 +546,7 @@ isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams c
 
 isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams const *params) {
     u64 raw_value;
-    memcpy(&raw_value, &value, 8);
+    memcpy(&raw_value, &value, sizeof(raw_value));
 
     bool is_negative = (raw_value & 0x8000000000000000) != 0;
     raw_value &= 0x7fffffffffffffff;
@@ -545,9 +569,9 @@ isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams c
             if (is_negative) {
                 string_writer_push_char(&string_writer, '-');
             }
-            string_writer_push_string(&string_writer, SV("inf"));
+            string_writer_push_string(&string_writer, SV(INFINITY_LITERAL));
         } else {
-            string_writer_push_string(&string_writer, SV("nan"));
+            string_writer_push_string(&string_writer, SV(NAN_LITERAL));
         }
         string_writer_push_char(&string_writer, '\0');
 
@@ -578,9 +602,161 @@ isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams c
     };
 
     return float_format(
-        (Float){is_negative, exponent, (Number){(u32[]){mantissa & 0xffffffff, mantissa >> 32}, 2}},
+        (FloatParts){
+            is_negative,
+            exponent,
+            (Number){(u32[]){mantissa & 0xffffffff, mantissa >> 32}, 2},
+        },
         string, string_size,
         params,
         arena
     );
+}
+
+static inline bool char_is_digit(char value) {
+    return '0' <= value && value <= '9';
+}
+
+typedef struct {
+    StringView special;
+    StringView sign;
+    StringView integer_part;
+    StringView fractional_part;
+    StringView exponent;
+} FloatLiteralParts;
+
+static bool float_literal_into_parts(
+    char const *string,
+    isize string_size,
+    FloatLiteralParts *parts
+) {
+    memset(parts, 0, sizeof(FloatLiteralParts));
+
+    char const *string_iter = string;
+
+    char const *string_end;
+    if (string_size >= 0) {
+        string_end = string + string_size;
+    } else {
+        string_end = string;
+        while (*string_end != '\0') {
+            string_end += 1;
+        }
+    }
+
+    // Sign
+    if (string_iter < string_end && *string_iter == '-') {
+        parts->sign = sv_range(string_iter, string_iter + 1);
+        string_iter += 1;
+    }
+
+    // Special values
+    if (strncmp(string_iter, INFINITY_LITERAL, string_end - string_iter) == 0) {
+        parts->special = sv_range(string_iter, string_end);
+        return true;
+    }
+    if (strncmp(string_iter, NAN_LITERAL, string_end - string_iter) == 0) {
+        // Don't allow "-nan" to be a valid float, because this doesn't make any sense.
+        if (parts->sign.size != 0) {
+            return false;
+        }
+
+        parts->special = sv_range(string_iter, string_end);
+        return true;
+    }
+
+    // Integer part (required)
+    if (string_iter < string_end) {
+        char const *integer_part_begin = string_iter;
+
+        if (*string_iter == '0') {
+            string_iter += 1;
+        } else if ('1' <= *string_iter && *string_iter <= '9') {
+            string_iter += 1;
+
+            while (string_iter < string_end) {
+                if (!char_is_digit(*string_iter)) {
+                    break;
+                }
+                string_iter += 1;
+            }
+        } else {
+            return false;
+        }
+
+        parts->integer_part = sv_range(integer_part_begin, string_iter);
+    }
+
+    // Fractional part
+    if (string_iter < string_end && *string_iter == '.') {
+        string_iter += 1;
+
+        char const *fractional_part_begin = string_iter;
+
+        if (string_iter < string_end && char_is_digit(*string_iter)) {
+            string_iter += 1;
+        } else {
+            return false;
+        }
+
+        while (string_iter < string_end) {
+            if (!char_is_digit(*string_iter)) {
+                break;
+            }
+            string_iter += 1;
+        }
+
+        parts->fractional_part = sv_range(fractional_part_begin, string_iter);
+    }
+
+    // Exponent
+    if (string_iter < string_end && (*string_iter == 'e' || *string_iter == 'E')) {
+        string_iter += 1;
+
+        char const *exponent_begin = string_iter;
+
+        if (string_iter < string_end && (*string_iter == '-' || *string_iter == '+')) {
+            string_iter += 1;
+        }
+
+        if (string_iter < string_end && char_is_digit(*string_iter)) {
+            string_iter += 1;
+        } else {
+            return false;
+        }
+
+        while (string_iter < string_end) {
+            if (!char_is_digit(*string_iter)) {
+                break;
+            }
+            string_iter += 1;
+        }
+
+        parts->exponent = sv_range(exponent_begin, string_iter);
+    }
+
+    return string_iter == string_end;
+}
+
+bool string_is_float(char const *string, isize string_size) {
+    FloatLiteralParts float_parts;
+    return float_literal_into_parts(string, string_size, &float_parts);
+}
+
+f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
+    FloatLiteralParts float_parts;
+    bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
+    assert(string_is_float);
+
+    // TODO: Not implemented.
+    return 0.0F;
+}
+
+f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
+    FloatLiteralParts float_parts;
+    bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
+    assert(string_is_float);
+
+    // TODO: Not implemented.
+    return 0.0;
 }

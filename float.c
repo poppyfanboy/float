@@ -12,6 +12,10 @@
 #include <string.h> // memcpy, memset, strncmp
 #include <assert.h> // assert
 
+static inline isize isize_min(isize left, isize right) {
+    return left < right ? left : right;
+}
+
 static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
@@ -259,16 +263,6 @@ static inline isize float_format(
         }
     }
 
-    StringWriter string_writer = {
-        .dest = string,
-        .dest_size = string_size,
-        .chars_written = 0,
-    };
-
-    if (float_parts.is_negative) {
-        string_writer_push_char(&string_writer, '-');
-    }
-
     // These are needed to store the quotients and products when converting to decimal.
     Number integer_part_swap = {
         .data = arena_alloc(&arena, integer_part_size * sizeof(u32)),
@@ -295,7 +289,7 @@ static inline isize float_format(
     {
         i8 *decimal_integer_part_begin = decimal_mantissa + decimal_mantissa_size;
 
-        do {
+        while (!number_is_zero(integer_part)) {
             u32 remainder;
             number_divide(integer_part, 10, integer_part_swap, &remainder);
 
@@ -306,7 +300,7 @@ static inline isize float_format(
             Number swap = integer_part_swap;
             integer_part_swap = integer_part;
             integer_part = swap;
-        } while (!number_is_zero(integer_part));
+        }
 
         bytes_reverse(decimal_integer_part_begin, decimal_mantissa + decimal_mantissa_size);
     }
@@ -314,7 +308,7 @@ static inline isize float_format(
     // Put the fractional part into the decimal mantissa.
     {
         // Truncate leading zeroes for small numbers.
-        if (number_is_zero(integer_part)) {
+        if (number_is_zero(float_parts.mantissa)) {
             while (!number_is_zero(fractional_part)) {
                 u32 overflow;
                 number_multiply(fractional_part, 10, fractional_part_swap, &overflow);
@@ -349,44 +343,56 @@ static inline isize float_format(
     // Actually "allocate" the decimal mantissa within the arena.
     arena.begin += decimal_mantissa_size;
 
-    enum {
-        ROUND_UP,
-        ROUND_DOWN,
-        ROUND_TO_EVEN,
-    } rounding;
+    // Exponential form (precision = 2 digits after the decimal point)
+    // 01235 * 10^e => 1.24 * 10^(e + 2)
+    // 09999 * 10^e => 1.00 * 10^(e + 3)
+    //
+    // Regular form (precision = 2 digits after the decimal point)
+    // 01235 * 10^(-3) =>      1.24
+    // 09999 * 10^(-3) =>     10.00
+    // 01235 * 10^2    => 123500.00
 
-    // The first non-zero digit of the decimal mantissa.
-    i8 *decimal_mantissa_begin = decimal_mantissa;
-    i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
-    while (decimal_mantissa_begin < decimal_mantissa_end && *decimal_mantissa_begin == 0) {
-        decimal_mantissa_begin += 1;
+    // decimal_mantissa[decimal_point_pos] is the first digit of the fractional part.
+    // This might be an out of bounds index.
+    isize decimal_point_pos;
+    if (params->exponential) {
+        decimal_point_pos = 0;
+
+        while (
+            decimal_point_pos < decimal_mantissa_size &&
+            decimal_mantissa[decimal_point_pos] == 0
+        ) {
+            decimal_point_pos += 1;
+        }
+
+        // Put the decimal point after the first non-zero digit.
+        // (Or after 0 if the whole number is 0.)
+        if (decimal_point_pos < decimal_mantissa_size) {
+            decimal_point_pos += 1;
+        }
+    } else {
+        decimal_point_pos = decimal_mantissa_size + decimal_exponent;
     }
 
     i8 last_significant_digit = 0;
     i8 rounding_digit = 0;
     {
-        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
+        isize last_significant_digit_pos = decimal_point_pos + params->precision - 1;
+        if (0 <= last_significant_digit_pos && last_significant_digit_pos < decimal_mantissa_size) {
+            last_significant_digit = decimal_mantissa[last_significant_digit_pos];
+        }
 
-        if (decimal_mantissa_iter < decimal_mantissa_end) {
-            isize precision_left = params->precision;
-
-            rounding_digit = *decimal_mantissa_iter;
-            decimal_mantissa_iter += 1;
-
-            while (precision_left > 0) {
-                last_significant_digit = rounding_digit;
-
-                if (decimal_mantissa_iter < decimal_mantissa_end) {
-                    rounding_digit = *decimal_mantissa_iter;
-                } else {
-                    rounding_digit = 0;
-                }
-
-                decimal_mantissa_iter += 1;
-                precision_left -= 1;
-            }
+        isize rounding_digit_pos = last_significant_digit_pos + 1;
+        if (0 <= rounding_digit_pos && rounding_digit_pos < decimal_mantissa_size) {
+            rounding_digit = decimal_mantissa[rounding_digit_pos];
         }
     }
+
+    enum {
+        ROUND_UP,
+        ROUND_DOWN,
+        ROUND_TO_EVEN,
+    } rounding;
 
     if (rounding_digit < 5) {
         rounding = ROUND_DOWN;
@@ -395,13 +401,10 @@ static inline isize float_format(
     } else {
         rounding = ROUND_TO_EVEN;
 
-        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
-        i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
-
-        // Skip past the rounding digit.
-        decimal_mantissa_iter += params->precision + 1;
-        while (decimal_mantissa_iter < decimal_mantissa_end) {
-            if (*decimal_mantissa_iter > 0) {
+        // Start at right after the rounding digit.
+        i8 *decimal_mantissa_iter = decimal_mantissa + decimal_point_pos + params->precision + 1;
+        while (decimal_mantissa_iter < decimal_mantissa + decimal_mantissa_size) {
+            if (*decimal_mantissa_iter != 0) {
                 rounding = ROUND_UP;
                 break;
             }
@@ -413,61 +416,82 @@ static inline isize float_format(
     if (rounding == ROUND_UP || rounding == ROUND_TO_EVEN && last_significant_digit % 2 == 1) {
         i8 overflow = 1;
 
-        i8 *decimal_mantissa_iter = decimal_mantissa_begin;
-        i8 *decimal_mantissa_end = decimal_mantissa + decimal_mantissa_size;
+        // Start at the last digit of the fractional part.
+        i8 *decimal_mantissa_iter = decimal_mantissa + decimal_point_pos + params->precision - 1;
 
-        decimal_mantissa_iter += params->precision - 1;
         while (decimal_mantissa_iter >= decimal_mantissa) {
             i8 intermediate_sum = overflow + *decimal_mantissa_iter;
+
             *decimal_mantissa_iter = intermediate_sum % 10;
             overflow = intermediate_sum / 10;
+
+            // We stop when there is no more overflow...
+            if (overflow == 0) {
+                break;
+            }
 
             decimal_mantissa_iter -= 1;
         }
 
-        // Recalculate position of the first non-zero mantissa digit, because an overflow could have
-        // happened during the rounding.
-        decimal_mantissa_begin = decimal_mantissa;
-        while (decimal_mantissa_begin < decimal_mantissa_end && *decimal_mantissa_begin == 0) {
-            decimal_mantissa_begin += 1;
+        // ...to adjust the decimal point when printing float in the exponential form:
+        if (params->exponential) {
+            decimal_point_pos = isize_min(
+                decimal_mantissa_iter - decimal_mantissa + 1,
+                decimal_point_pos
+            );
         }
     }
 
-    i8 *decimal_mantissa_iter = decimal_mantissa_begin;
-    isize precision_left = params->precision;
+    StringWriter string_writer = {
+        .dest = string,
+        .dest_size = string_size,
+        .chars_written = 0,
+    };
 
-    // Print the first digit and the decimal point:
-    if (decimal_mantissa_iter < decimal_mantissa_end) {
-        string_writer_push_char(&string_writer, '0' + *decimal_mantissa_iter);
-        decimal_mantissa_iter += 1;
-        precision_left -= 1;
-    } else {
-        string_writer_push_char(&string_writer, '0');
+    if (float_parts.is_negative) {
+        string_writer_push_char(&string_writer, '-');
+    }
+
+    // Print the integer part:
+    {
+        isize current_decimal_place = 0;
+
+        // Skip the leading zeroes.
+        while (
+            current_decimal_place < decimal_point_pos &&
+            decimal_mantissa[current_decimal_place] == 0
+        ) {
+            current_decimal_place += 1;
+        }
+
+        if (current_decimal_place < decimal_point_pos) {
+            for (isize i = current_decimal_place; i < decimal_point_pos; i += 1) {
+                i8 next_digit = i < decimal_mantissa_size ? decimal_mantissa[i] : 0;
+                string_writer_push_char(&string_writer, '0' + next_digit);
+            }
+        } else {
+            string_writer_push_char(&string_writer, '0');
+        }
     }
 
     string_writer_push_char(&string_writer, '.');
 
-    if (precision_left > 0) {
-        while (precision_left > 0) {
-            if (decimal_mantissa_iter < decimal_mantissa_end) {
-                string_writer_push_char(&string_writer, '0' + *decimal_mantissa_iter);
-                decimal_mantissa_iter += 1;
-            } else {
-                string_writer_push_char(&string_writer, '0');
-            }
-
-            precision_left -= 1;
+    // Print the fractional part:
+    for (isize i = 0; i < params->precision; i += 1) {
+        i8 next_digit = 0;
+        if (0 <= decimal_point_pos + i && decimal_point_pos + i < decimal_mantissa_size) {
+            next_digit = decimal_mantissa[decimal_point_pos + i];
         }
-    } else {
-        string_writer_push_char(&string_writer, '0');
+
+        string_writer_push_char(&string_writer, '0' + next_digit);
     }
 
-    // Print the adjusted exponent:
-    {
+    // Print the exponent:
+    if (params->exponential) {
         string_writer_push_char(&string_writer, 'e');
         string_writer_push_int(
             &string_writer,
-            decimal_exponent + isize_max(decimal_mantissa_end - decimal_mantissa_begin, 1) - 1
+            decimal_exponent + isize_max(decimal_mantissa_size - decimal_point_pos, 0)
         );
     }
 

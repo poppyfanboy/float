@@ -56,6 +56,7 @@ typedef struct {
 
 typedef struct {
     isize precision;
+    bool exponential;
 } FloatFormatParams;
 
 // You can pass -1 as string size in case the string is null-terminated.

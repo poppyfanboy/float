@@ -142,6 +142,19 @@ typedef struct {
     isize size;
 } Number;
 
+static void number_resize(Number *number, isize new_size, FloatLibAllocator *allocator) {
+    assert(new_size > number->size);
+
+    u32 *new_data = allocator->alloc(new_size * sizeof(u32), allocator->user_data);
+    memset(new_data, 0, new_size * sizeof(u32));
+    memcpy(new_data, number->data, number->size * sizeof(u32));
+
+    allocator->dealloc(number->data, number->size, allocator->user_data);
+
+    number->data = new_data;
+    number->size = new_size;
+}
+
 // An empty number (size == 0) is treated as zero.
 static bool number_is_zero(Number number) {
     for (isize i = 0; i < number.size; i += 1) {
@@ -185,6 +198,20 @@ static void number_multiply(Number multiplicand, u32 multiplier, Number product,
 
         product.data[i] = intermediate_product & 0xffffffff;
         intermediate_overflow = intermediate_product >> 32;
+    }
+
+    *overflow = intermediate_overflow;
+}
+
+static void number_add(Number left_term, u32 right_term, Number sum, u32 *overflow) {
+    u32 intermediate_overflow = right_term;
+
+    // Start from the least significant digits of the multiplicand.
+    for (isize i = 0; i < left_term.size; i += 1) {
+        u64 intermediate_sum = (u64)intermediate_overflow + (u64)left_term.data[i];
+
+        sum.data[i] = intermediate_sum & 0xffffffff;
+        intermediate_overflow = intermediate_sum >> 32;
     }
 
     *overflow = intermediate_overflow;
@@ -669,18 +696,24 @@ static bool float_literal_into_parts(
     }
 
     // Sign
-    if (string_iter < string_end && *string_iter == '-') {
+    if (string_iter < string_end && (*string_iter == '-' || *string_iter == '+')) {
         parts->sign = sv_range(string_iter, string_iter + 1);
         string_iter += 1;
     }
 
     // Special values
-    if (strncmp(string_iter, INFINITY_LITERAL, string_end - string_iter) == 0) {
+    if (
+        string_end - string_iter > 0 &&
+        strncmp(string_iter, INFINITY_LITERAL, string_end - string_iter) == 0
+    ) {
         parts->special = sv_range(string_iter, string_end);
         return true;
     }
-    if (strncmp(string_iter, NAN_LITERAL, string_end - string_iter) == 0) {
-        // Don't allow "-nan" to be a valid float, because this doesn't make any sense.
+    if (
+        string_end - string_iter > 0 &&
+        strncmp(string_iter, NAN_LITERAL, string_end - string_iter) == 0
+    ) {
+        // Don't allow "-nan" or "+nan" to be a valid float, because this doesn't make any sense.
         if (parts->sign.size != 0) {
             return false;
         }
@@ -709,6 +742,8 @@ static bool float_literal_into_parts(
         }
 
         parts->integer_part = sv_range(integer_part_begin, string_iter);
+    } else {
+        return false;
     }
 
     // Fractional part
@@ -772,8 +807,199 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
     assert(string_is_float);
 
-    // TODO: Not implemented.
-    return 0.0F;
+    if (
+        float_parts.special.size > 0 &&
+        strncmp(NAN_LITERAL, float_parts.special.data, float_parts.special.size) == 0
+    ) {
+        return 0.0F / 0.0F;
+    }
+
+    if (
+        float_parts.special.size > 0 &&
+        strncmp(INFINITY_LITERAL, float_parts.special.data, float_parts.special.size) == 0
+    ) {
+        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+            return -1.0F / 0.0F;
+        } else {
+            return 1.0F / 0.0F;
+        }
+    }
+
+    isize decimal_exponent = 0;
+    if (float_parts.exponent.size > 0) {
+        int decimal_exponent_sign = 1;
+
+        const char *decimal_exponent_iter = float_parts.exponent.data;
+        const char *decimal_exponent_end = float_parts.exponent.data + float_parts.exponent.size;
+
+        if (*decimal_exponent_iter == '-') {
+            decimal_exponent_sign = -1;
+            decimal_exponent_iter += 1;
+        }
+
+        // FIXME: Handle integer overflows.
+        while (decimal_exponent_iter < decimal_exponent_end) {
+            decimal_exponent = 10 * decimal_exponent + (*decimal_exponent_iter - '0');
+            decimal_exponent_iter += 1;
+        }
+
+        decimal_exponent *= decimal_exponent_sign;
+    }
+    assert(decimal_exponent >= 0 && "Not implemented");
+
+    Number mantissa = {
+        .data = allocator->alloc(1 * sizeof(u32), allocator->user_data),
+        .size = 1,
+    };
+    memset(mantissa.data, 0, mantissa.size * sizeof(u32));
+
+    Number mantissa_swap = {
+        .data = allocator->alloc(1 * sizeof(u32), allocator->user_data),
+        .size = 1,
+    };
+
+    for (isize i = 0; i < float_parts.integer_part.size; i += 1) {
+        {
+            u32 overflow;
+            number_multiply(mantissa, 10, mantissa_swap, &overflow);
+            if (overflow != 0) {
+                isize overflow_place = mantissa.size;
+
+                number_resize(&mantissa, 2 * mantissa.size, allocator);
+                number_resize(&mantissa_swap, 2 * mantissa_swap.size, allocator);
+
+                mantissa_swap.data[overflow_place] = overflow;
+            }
+        }
+
+        {
+            u32 overflow;
+            number_add(mantissa_swap, float_parts.integer_part.data[i] - '0', mantissa, &overflow);
+            if (overflow != 0) {
+                isize overflow_place = mantissa.size;
+
+                number_resize(&mantissa, 2 * mantissa.size, allocator);
+                number_resize(&mantissa_swap, 2 * mantissa_swap.size, allocator);
+
+                mantissa.data[overflow_place] = overflow;
+            }
+        }
+    }
+
+    for (isize i = 0; i < decimal_exponent; i += 1) {
+        u32 overflow;
+        number_multiply(mantissa, 10, mantissa_swap, &overflow);
+        if (overflow != 0) {
+            isize overflow_place = mantissa.size;
+
+            number_resize(&mantissa, 2 * mantissa.size, allocator);
+            number_resize(&mantissa_swap, 2 * mantissa_swap.size, allocator);
+
+            mantissa_swap.data[overflow_place] = overflow;
+        }
+
+        Number swap = mantissa;
+        mantissa = mantissa_swap;
+        mantissa_swap = swap;
+    }
+
+    if (number_is_zero(mantissa)) {
+        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+            return -0.0F;
+        } else {
+            return 0.0F;
+        }
+    }
+
+    // Mantissa size without an implicit 1.
+    int const ieee_mantissa_bits = 23;
+
+    u32 raw_mantissa;
+    isize mantissa_bits;
+    int rounding_bit = 0;
+    for (isize i = mantissa.size - 1; i >= 0; i -= 1) {
+        if (mantissa.data[i] != 0) {
+            mantissa_bits = i * 32 + (32 - __builtin_clz(mantissa.data[i]));
+
+            int current_digit_bits = 32 - __builtin_clz(mantissa.data[i]);
+            int next_digit_bits = isize_max((ieee_mantissa_bits + 1) - current_digit_bits, 0);
+
+            int leftover_bits = isize_max(current_digit_bits - (ieee_mantissa_bits + 1), 0);
+            u32 digit_mask = 0xffffffff << leftover_bits;
+
+            raw_mantissa = (mantissa.data[i] & digit_mask) >> leftover_bits;
+            mantissa.data[i] = mantissa.data[i] & ~digit_mask;
+
+            if (leftover_bits > 0) {
+                u32 rounding_bit_mask = 1 << (leftover_bits - 1);
+                rounding_bit = (mantissa.data[i] & rounding_bit_mask) != 0;
+                mantissa.data[i] = mantissa.data[i] & ~rounding_bit_mask;
+            }
+
+            raw_mantissa <<= next_digit_bits;
+
+            if (i - 1 >= 0 && next_digit_bits > 0) {
+                int leftover_bits = 32 - next_digit_bits;
+                u32 digit_mask = 0xffffffff << leftover_bits;
+
+                raw_mantissa |= ((mantissa.data[i - 1] & digit_mask) >> leftover_bits);
+                mantissa.data[i - 1] = mantissa.data[i - 1] & ~digit_mask;
+
+                if (leftover_bits > 0) {
+                    u32 rounding_bit_mask = 1 << (leftover_bits - 1);
+                    rounding_bit = (mantissa.data[i - 1] & rounding_bit_mask) != 0;
+                    mantissa.data[i - 1] = mantissa.data[i - 1] & ~rounding_bit_mask;
+                }
+            }
+
+            break;
+        }
+    }
+
+    int sticky_bit = 0;
+    for (isize i = 0; i < mantissa.size; i += 1) {
+        if (mantissa.data[i] != 0) {
+            sticky_bit = 1;
+            break;
+        }
+    }
+
+    u32 raw_exponent = 127 + (mantissa_bits - 1);
+
+    if (rounding_bit == 1 && sticky_bit == 1) {
+        raw_mantissa += 1;
+    }
+    if (rounding_bit == 1 && sticky_bit == 0 && raw_mantissa % 2 == 1) {
+        raw_mantissa += 1;
+    }
+
+    if (raw_mantissa == 0x1000000) {
+        raw_mantissa >>= 1;
+        raw_exponent += 1;
+    }
+
+    u32 implicit_one_mask = ~((u32)1 << (32 - __builtin_clz(raw_mantissa) - 1));
+    raw_mantissa = raw_mantissa & implicit_one_mask;
+
+    if (raw_exponent >= 255) {
+        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+            return -1.0F / 0.0F;
+        } else {
+            return 1.0F / 0.0F;
+        }
+    }
+
+    u32 raw_sign = 0;
+    if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+        raw_sign = 0x80000000;
+    }
+
+    u32 raw_value = raw_sign | raw_exponent << ieee_mantissa_bits | raw_mantissa;
+
+    f32 value;
+    memcpy(&value, &raw_value, sizeof(u32));
+
+    return value;
 }
 
 f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
@@ -781,6 +1007,6 @@ f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
     assert(string_is_float);
 
-    // TODO: Not implemented.
+    assert(false && "Not implemented");
     return 0.0;
 }

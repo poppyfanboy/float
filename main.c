@@ -1,3 +1,4 @@
+#define FLOAT_LIB_USE_DEFAULT_ALLOCATOR
 #include "float.h"
 
 #include <float.h>
@@ -41,6 +42,20 @@ void f64_print(f64 value, isize precision, bool exponential) {
     }
 
     free(buffer);
+}
+
+void f32_test_parse(char const *string) {
+    if (!string_is_float(string, -1)) {
+        printf("'%s' is not a float.\n", string);
+    } else {
+        f32 output = f32_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+        printf(
+            "%1.8e (via strtof: %1.8e) (%s)\n",
+            strtof(string, NULL),
+            output,
+            output == strtof(string, NULL) ? "OK" : "FAIL"
+        );
+    }
 }
 
 int main(void) {
@@ -99,6 +114,16 @@ int main(void) {
     f64_print(nan(""), 16, true);
     f64_print(INFINITY, 16, true);
     f64_print(-INFINITY, 16, true);
+
+    printf("\n");
+
+    f32_test_parse("0");
+    f32_test_parse("1");
+    f32_test_parse("123");
+    f32_test_parse("123e10");
+    f32_test_parse("33554431");
+    f32_test_parse("12345e8");
+    f32_test_parse("12345464e10323");
 
     printf("\n");
 

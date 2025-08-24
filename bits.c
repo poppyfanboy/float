@@ -192,8 +192,17 @@ inline void bits_shift_right(u32 *words, isize word_count, isize shift) {
 }
 
 // Fill bit_count bits starting from starting_offset towards the more significant bits.
-void bits_fill(u32 *words, isize word_count, isize starting_offset, isize bit_count, int value) {
-    assert((starting_offset + bit_count) / 32 <= word_count);
+static inline void bits_fill(
+    u32 *words, isize word_count,
+    isize starting_offset, isize bit_count,
+    int value
+) {
+    // Basically (starting_offset + bit_count <= 32 * word_count) check but without overflows (?):
+    isize const min_word_count =
+        starting_offset / 32 +                              // whole words worth of starting offset
+        bit_count / 32 +                                    // whole words worth of bits
+        (starting_offset % 32 + bit_count % 32 + 31) / 32;  // remainders summed up and rounded up
+    assert(min_word_count <= word_count);
 
     if (bit_count > 0) {
         u32 *first_word = &words[starting_offset / 32];
@@ -208,11 +217,12 @@ void bits_fill(u32 *words, isize word_count, isize starting_offset, isize bit_co
             *first_word |= mask;
         }
 
-        isize first_word_bits = 32 - starting_offset % 32;
+        isize first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
         bit_count -= first_word_bits;
         starting_offset += first_word_bits;
     }
 
+    assert(bit_count >= 0);
     assert(bit_count == 0 || starting_offset % 32 == 0);
     if (bit_count / 32 > 0) {
         u8 fill_value = value == 0 ? 0 : 0xff;
@@ -223,6 +233,7 @@ void bits_fill(u32 *words, isize word_count, isize starting_offset, isize bit_co
         starting_offset += middle_bits;
     }
 
+    assert(bit_count >= 0);
     assert(bit_count == 0 || starting_offset % 32 == 0 && bit_count < 32);
     if (bit_count > 0) {
         u32 *last_word = &words[starting_offset / 32];
@@ -238,12 +249,77 @@ void bits_fill(u32 *words, isize word_count, isize starting_offset, isize bit_co
     }
 }
 
-inline void bits_set(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
+void bits_set(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
     bits_fill(words, word_count, starting_offset, bit_count, 1);
 }
 
-inline void bits_clear(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
+void bits_clear(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
     bits_fill(words, word_count, starting_offset, bit_count, 0);
+}
+
+static u32 bits_read(u32 *words, isize starting_offset, int bit_count) {
+    assert(0 < bit_count && bit_count <= 32);
+
+    u32 *first_word = &words[starting_offset / 32];
+    int first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
+    u32 result = (*first_word >> (starting_offset % 32)) & (0xffffffff >> (32 - first_word_bits));
+
+    int second_word_bits = bit_count - first_word_bits;
+    if (second_word_bits > 0) {
+        u32 *second_word = first_word + 1;
+        result |= (*second_word & (0xffffffff >> (32 - second_word_bits))) << first_word_bits;
+    }
+
+    return result;
+}
+
+void bits_copy_nonoverlapping(
+    u32 *source_words, isize source_starting_offset,
+    u32 *dest_words, isize dest_starting_offset,
+    isize bit_count
+) {
+    if (bit_count > 0) {
+        u32 *first_word = &dest_words[dest_starting_offset / 32];
+        isize first_word_bits = isize_min(bit_count, 32 - dest_starting_offset % 32);
+
+        u32 source_data = bits_read(source_words, source_starting_offset, first_word_bits);
+
+        u32 dest_clear_mask = 0xffffffff;
+        dest_clear_mask >>= 32 - isize_min(bit_count, 32);
+        dest_clear_mask <<= dest_starting_offset % 32;
+        *first_word &= ~dest_clear_mask;
+        *first_word |= source_data << dest_starting_offset % 32;
+
+        source_starting_offset += first_word_bits;
+        dest_starting_offset += first_word_bits;
+        bit_count -= first_word_bits;
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || dest_starting_offset % 32 == 0);
+    if (bit_count / 32 > 0) {
+        while (bit_count / 32 > 0) {
+            u32 *middle_word = &dest_words[dest_starting_offset / 32];
+            *middle_word = bits_read(source_words, source_starting_offset, 32);
+
+            source_starting_offset += 32;
+            dest_starting_offset += 32;
+            bit_count -= 32;
+        }
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || dest_starting_offset % 32 == 0 && bit_count < 32);
+    if (bit_count > 0) {
+        u32 *last_word = &dest_words[dest_starting_offset / 32];
+
+        u32 source_data = bits_read(source_words, source_starting_offset, bit_count);
+
+        u32 dest_clear_mask = 0xffffffff;
+        dest_clear_mask >>= 32 - bit_count;
+        *last_word &= ~dest_clear_mask;
+        *last_word |= source_data;
+    }
 }
 
 // Tests
@@ -341,6 +417,67 @@ void bits_fill_test(
     free(expected_words);
 
     free(input_string_formatted);
+    free(expected_string_formatted);
+    free(actual_string);
+}
+
+void bits_copy_nonoverlapping_test(
+    isize bit_count,
+    char const *source_string, isize source_starting_offset,
+    char const *dest_string, isize dest_starting_offset,
+    char const *expected_string
+) {
+    test_count += 1;
+
+    isize source_word_count = bits_from_string(source_string, -1, NULL, 0);
+    u32 *source_words = malloc(source_word_count * sizeof(u32));
+    bits_from_string(source_string, -1, source_words, source_word_count);
+    isize source_string_formatted_size = bits_to_string(source_words, source_word_count, NULL, 0);
+    char *source_string_formatted = malloc(source_string_formatted_size);
+    bits_to_string(source_words, source_word_count, source_string_formatted, source_string_formatted_size);
+
+    isize dest_word_count = bits_from_string(dest_string, -1, NULL, 0);
+    u32 *dest_words = malloc(dest_word_count * sizeof(u32));
+    bits_from_string(dest_string, -1, dest_words, dest_word_count);
+    isize dest_string_formatted_size = bits_to_string(dest_words, dest_word_count, NULL, 0);
+    char *dest_string_formatted = malloc(dest_string_formatted_size);
+    bits_to_string(dest_words, dest_word_count, dest_string_formatted, dest_string_formatted_size);
+
+    isize expected_word_count = bits_from_string(expected_string, -1, NULL, 0);
+    u32 *expected_words = malloc(expected_word_count * sizeof(u32));
+    bits_from_string(expected_string, -1, expected_words, expected_word_count);
+    isize expected_string_formatted_size = bits_to_string(expected_words, expected_word_count, NULL, 0);
+    char *expected_string_formatted = malloc(expected_string_formatted_size);
+    bits_to_string(expected_words, expected_word_count, expected_string_formatted, expected_string_formatted_size);
+
+    bits_copy_nonoverlapping(
+        source_words, source_starting_offset,
+        dest_words, dest_starting_offset,
+        bit_count
+    );
+    isize actual_string_size = bits_to_string(dest_words, dest_word_count, NULL, 0);
+    char *actual_string = malloc(actual_string_size);
+    bits_to_string(dest_words, dest_word_count, actual_string, actual_string_size);
+
+    if (memcmp(expected_words, dest_words, expected_word_count * sizeof(u32)) == 0) {
+        tests_passed += 1;
+    } else {
+        printf("Test #%d failed\n", test_count);
+        printf("source:\t%s\n", source_string_formatted);
+        printf("offset:\t%td\n", source_starting_offset);
+        printf("dest:\t%s\n", dest_string_formatted);
+        printf("offset:\t%td\n", dest_starting_offset);
+        printf("bits:\t%td\n", bit_count);
+        printf("Expected:\n\t%s\n", expected_string_formatted);
+        printf("Actual:\n\t%s\n\n", actual_string);
+    }
+
+    free(source_words);
+    free(dest_words);
+    free(expected_words);
+
+    free(source_string_formatted);
+    free(dest_string_formatted);
     free(expected_string_formatted);
     free(actual_string);
 }
@@ -500,6 +637,68 @@ int main(void) {
     bits_clear_test(24, 100,
         "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
         "11110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000111111111111111111111111"
+    );
+
+    // bits_copy_nonoverlapping tests
+
+    // Copying zero bits:
+    bits_copy_nonoverlapping_test(0,
+        "00000000000000000000000000000000", 0,
+        "11111111111111111111111111111111", 0,
+        "11111111111111111111111111111111"
+    );
+
+    // Copying multiples of 32 bits at aligned offsets:
+    bits_copy_nonoverlapping_test(64,
+        "00000000000000000000000000000000 11111111111111111111111111111111 11111111111111111111111111111111 00000000000000000000000000000000", 32,
+        "00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000", 64,
+        "11111111111111111111111111111111 11111111111111111111111111111111 00000000000000000000000000000000 00000000000000000000000000000000"
+    );
+
+    // Copying < 32 bits within the first word:
+    bits_copy_nonoverlapping_test(15,
+        "00000000000000000111111111111111", 0,
+        "00000000000000000000000000000000", 0,
+        "00000000000000000111111111111111"
+    );
+    bits_copy_nonoverlapping_test(15,
+        "00000000011111111111111100000000", 8,
+        "00000000000000000000000000000000", 4,
+        "00000000000001111111111111110000"
+    );
+    bits_copy_nonoverlapping_test(15,
+        "0000000000000000000000000111111111111111000000000000000000000000", 24,
+        "00000000000000000000000000000000", 4,
+        "00000000000001111111111111110000"
+    );
+    bits_copy_nonoverlapping_test(15,
+        "00000111111111111111000000000000", 12,
+        "0000000000000000000000000000000000000000000000000000000000000000", 33,
+        "0000000000000000111111111111111000000000000000000000000000000000"
+    );
+
+    // Copying < 32 bits within multiple words:
+    bits_copy_nonoverlapping_test(15,
+        "00000000000000000111111111111111", 0,
+        "0000000000000000000000000000000000000000000000000000000000000000", 28,
+        "0000000000000000000001111111111111110000000000000000000000000000"
+    );
+    bits_copy_nonoverlapping_test(20,
+        "0000000000000000000000000001111111111111111111100000000000000000", 17,
+        "0000000000000000000000000000000000000000000000000000000000000000", 13,
+        "0000000000000000000000000000000111111111111111111110000000000000"
+    );
+
+    // Copying > 32 bits:
+    bits_copy_nonoverlapping_test(76,
+        "00000000000000011111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000", 37,
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", 52,
+        "11111111111111111111111111111111111111111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000"
+    );
+    bits_copy_nonoverlapping_test(76,
+        "10010110010101010110010010100101111101010100000101010101010101111001010101010010100100110100110111100010110101010010111100011010", 37,
+        "10101111110111111110010101010010101010101111000101010101110101011010101010100101110101010110011101001010101001000001100000011010", 52,
+        "10110010010100101111101010100000101010101010101111001010101010010100100110100101110101010110011101001010101001000001100000011010"
     );
 
     printf("%d/%d tests passed.\n", tests_passed, test_count);

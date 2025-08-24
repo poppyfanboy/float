@@ -73,6 +73,48 @@ static inline StringView sv_range(char const *begin, char const *end) {
     };
 }
 
+static isize isize_parse(StringView string, bool *overflow, bool *underflow) {
+    *overflow = false;
+    *underflow = false;
+
+    isize const max_digits = 19;
+    if (string.size > max_digits) {
+        *overflow = true;
+        return 0;
+    }
+
+    isize prev_value = 0;
+    isize value = 0;
+    if (string.size > 0) {
+        int value_sign = 1;
+
+        const char *string_iter = string.data;
+        const char *string_end = string.data + string.size;
+
+        if (*string_iter == '-') {
+            value_sign = -1;
+            string_iter += 1;
+        }
+
+        // FIXME: Handle integer overflows.
+        while (string_iter < string_end) {
+            prev_value = value;
+            value = 10 * value + (*string_iter - '0');
+            string_iter += 1;
+        }
+
+        prev_value *= 10;
+        if (prev_value >= 9223372036854775808llu - (*(string_iter - 1) - '0')) {
+            *overflow = true;
+            return 0;
+        }
+
+        value *= value_sign;
+    }
+
+    return value;
+}
+
 // Writes data into the dest buffer if it is not null. Otherwise, counts how many chars would have
 // been written into the buffer, if there was one.
 typedef struct {
@@ -130,6 +172,183 @@ static void string_writer_push_int(StringWriter *string_writer, isize integer) {
     }
 
     string_writer->chars_written += decimal_size;
+}
+
+static u32 bits_read(u32 *words, isize starting_offset, int bit_count) {
+    assert(0 < bit_count && bit_count <= 32);
+
+    u32 *first_word = &words[starting_offset / 32];
+    int first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
+    u32 result = (*first_word >> (starting_offset % 32)) & (0xffffffff >> (32 - first_word_bits));
+
+    int second_word_bits = bit_count - first_word_bits;
+    if (second_word_bits > 0) {
+        u32 *second_word = first_word + 1;
+        result |= (*second_word & (0xffffffff >> (32 - second_word_bits))) << first_word_bits;
+    }
+
+    return result;
+}
+
+// Positive shifts are left shifts, because they shift bits into *more* significant places.
+static void bits_shift(u32 *words, isize word_count, isize shift) {
+    if (shift >= 32 || shift <= -32) {
+        isize word_shift_amount = isize_min(shift > 0 ? shift / 32 : -(shift / 32), word_count);
+        isize word_copy_amount = word_count - word_shift_amount;
+
+        if (shift > 0) {
+            memmove(words + word_shift_amount, words, word_copy_amount * sizeof(u32));
+            memset(words, 0, word_shift_amount * sizeof(u32));
+        } else {
+            memmove(words, words + word_shift_amount, word_copy_amount * sizeof(u32));
+            memset(words + word_count - word_shift_amount, 0, word_shift_amount * sizeof(u32));
+        }
+    }
+
+    if (shift % 32 != 0) {
+        isize shift_amount = shift > 0 ? shift % 32 : -(shift % 32);
+
+        if (shift > 0) {
+            u32 overflow = 0;
+            for (isize i = 0; i < word_count; i += 1) {
+                u32 next_overflow = words[i] >> (32 - shift_amount);
+                words[i] = (words[i] << shift_amount) | overflow;
+
+                overflow = next_overflow;
+            }
+        } else {
+            u32 overflow = 0;
+            for (isize i = word_count - 1; i >= 0; i -= 1) {
+                u32 next_overflow = words[i] << (32 - shift_amount);
+                words[i] = (words[i] >> shift_amount) | overflow;
+
+                overflow = next_overflow;
+            }
+        }
+    }
+}
+
+static inline void bits_shift_left(u32 *words, isize word_count, isize shift) {
+    bits_shift(words, word_count, shift);
+}
+
+static inline void bits_shift_right(u32 *words, isize word_count, isize shift) {
+    // NOTE: OCD
+    isize const isize_min = -(isize)((usize)(-1) >> 1) - 1;
+    if (shift == isize_min) {
+        bits_shift(words, word_count, -1);
+        shift += 1;
+    }
+
+    bits_shift(words, word_count, -shift);
+}
+
+// Fill bit_count bits starting from starting_offset towards the more significant bits.
+static inline void bits_fill(
+    u32 *words,
+    isize starting_offset, isize bit_count,
+    int value
+) {
+    if (bit_count > 0) {
+        u32 *first_word = &words[starting_offset / 32];
+
+        u32 mask = 0xffffffff;
+        mask >>= 32 - isize_min(bit_count, 32);
+        mask <<= starting_offset % 32;
+
+        if (value == 0) {
+            *first_word &= ~mask;
+        } else {
+            *first_word |= mask;
+        }
+
+        isize first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
+        bit_count -= first_word_bits;
+        starting_offset += first_word_bits;
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || starting_offset % 32 == 0);
+    if (bit_count / 32 > 0) {
+        u8 fill_value = value == 0 ? 0 : 0xff;
+        memset(words + starting_offset / 32, fill_value, (bit_count / 32) * sizeof(u32));
+
+        isize middle_bits = (bit_count / 32) * 32;
+        bit_count -= middle_bits;
+        starting_offset += middle_bits;
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || starting_offset % 32 == 0 && bit_count < 32);
+    if (bit_count > 0) {
+        u32 *last_word = &words[starting_offset / 32];
+
+        u32 mask = 0xffffffff;
+        mask >>= 32 - bit_count;
+
+        if (value == 0) {
+            *last_word &= ~mask;
+        } else {
+            *last_word |= mask;
+        }
+    }
+}
+
+void bits_set(u32 *words, isize starting_offset, isize bit_count) {
+    bits_fill(words, starting_offset, bit_count, 1);
+}
+
+void bits_clear(u32 *words, isize starting_offset, isize bit_count) {
+    bits_fill(words, starting_offset, bit_count, 0);
+}
+
+static void bits_copy_nonoverlapping(
+    u32 *source_words, isize source_starting_offset,
+    u32 *dest_words, isize dest_starting_offset,
+    isize bit_count
+) {
+    if (bit_count > 0) {
+        u32 *first_word = &dest_words[dest_starting_offset / 32];
+        isize first_word_bits = isize_min(bit_count, 32 - dest_starting_offset % 32);
+
+        u32 source_data = bits_read(source_words, source_starting_offset, first_word_bits);
+
+        u32 dest_clear_mask = 0xffffffff;
+        dest_clear_mask >>= 32 - isize_min(bit_count, 32);
+        dest_clear_mask <<= dest_starting_offset % 32;
+        *first_word &= ~dest_clear_mask;
+        *first_word |= source_data << dest_starting_offset % 32;
+
+        source_starting_offset += first_word_bits;
+        dest_starting_offset += first_word_bits;
+        bit_count -= first_word_bits;
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || dest_starting_offset % 32 == 0);
+    if (bit_count / 32 > 0) {
+        while (bit_count / 32 > 0) {
+            u32 *middle_word = &dest_words[dest_starting_offset / 32];
+            *middle_word = bits_read(source_words, source_starting_offset, 32);
+
+            source_starting_offset += 32;
+            dest_starting_offset += 32;
+            bit_count -= 32;
+        }
+    }
+
+    assert(bit_count >= 0);
+    assert(bit_count == 0 || dest_starting_offset % 32 == 0 && bit_count < 32);
+    if (bit_count > 0) {
+        u32 *last_word = &dest_words[dest_starting_offset / 32];
+
+        u32 source_data = bits_read(source_words, source_starting_offset, bit_count);
+
+        u32 dest_clear_mask = 0xffffffff;
+        dest_clear_mask >>= 32 - bit_count;
+        *last_word &= ~dest_clear_mask;
+        *last_word |= source_data;
+    }
 }
 
 // A multi-word unsigned integer number.
@@ -220,8 +439,16 @@ static void number_add(Number left_term, u32 right_term, Number sum, u32 *overfl
 #define INFINITY_LITERAL "inf"
 #define NAN_LITERAL "nan"
 
+typedef enum {
+    FLOAT_KIND_REGULAR,
+    FLOAT_KIND_INFINITY,
+    FLOAT_KIND_NAN,
+} FloatKind;
+
 // Represents a value of: (is_negative ? -1 : 1) * mantissa * (2 ^ exponent)
 typedef struct {
+    FloatKind kind;
+
     bool is_negative;
     isize exponent;
     Number mantissa;
@@ -479,6 +706,19 @@ static inline isize float_format(
         string_writer_push_char(&string_writer, '-');
     }
 
+    // Print the special values:
+    if (float_parts.kind != FLOAT_KIND_REGULAR) {
+        if (float_parts.kind == FLOAT_KIND_INFINITY) {
+            string_writer_push_string(&string_writer, SV(INFINITY_LITERAL));
+        }
+        if (float_parts.kind == FLOAT_KIND_NAN) {
+            string_writer_push_string(&string_writer, SV(NAN_LITERAL));
+        }
+
+        string_writer_push_char(&string_writer, '\0');
+        return string_writer.chars_written;
+    }
+
     // Print the integer part:
     {
         isize current_decimal_place = 0;
@@ -527,11 +767,21 @@ static inline isize float_format(
 }
 
 isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams const *params) {
+    FloatParts float_parts = {0};
+
+    // Should be enough memory to convert any f32 float?
+    u8 arena_buffer[8 * 1024];
+    Arena arena = {
+        .begin = arena_buffer,
+        .end = arena_buffer + 8 * 1024,
+    };
+
     u32 raw_value;
     memcpy(&raw_value, &value, sizeof(raw_value));
 
     bool is_negative = (raw_value & 0x80000000) != 0;
     raw_value &= 0x7fffffff;
+    float_parts.is_negative = is_negative;
 
     // Mantissa size without an implicit 1.
     int const mantissa_bits = 23;
@@ -541,66 +791,54 @@ isize f32_format(f32 value, char *string, isize string_size, FloatFormatParams c
 
     // Handle infinities and NaNs.
     if (raw_exponent == 255) {
-        StringWriter string_writer = {
-            .dest = string,
-            .dest_size = string_size,
-            .chars_written = 0,
-        };
-
         if ((raw_value & mantissa_mask) == 0) {
-            if (is_negative) {
-                string_writer_push_char(&string_writer, '-');
-            }
-            string_writer_push_string(&string_writer, SV(INFINITY_LITERAL));
+            float_parts.kind = FLOAT_KIND_INFINITY;
         } else {
-            string_writer_push_string(&string_writer, SV(NAN_LITERAL));
-        }
-        string_writer_push_char(&string_writer, '\0');
-
-        return string_writer.chars_written;
-    }
-
-    isize exponent;
-    u32 mantissa;
-    if (raw_exponent == 0) {
-        // Subnormals and zero.
-        exponent = -126 - mantissa_bits;
-        mantissa = raw_value & mantissa_mask;
-
-        if (mantissa == 0) {
-            exponent = 0;
+            float_parts.kind = FLOAT_KIND_NAN;
         }
     } else {
-        // Normal floats (with an implicit one).
-        exponent = raw_exponent - 127 - mantissa_bits;
-        mantissa = (mantissa_mask + 1) | (raw_value & mantissa_mask);
+        isize exponent;
+        u32 mantissa;
+        if (raw_exponent == 0) {
+            // Subnormals and zero.
+            exponent = -126 - mantissa_bits;
+            mantissa = raw_value & mantissa_mask;
+
+            if (mantissa == 0) {
+                exponent = 0;
+            }
+        } else {
+            // Normal floats (with an implicit one).
+            exponent = raw_exponent - 127 - mantissa_bits;
+            mantissa = (mantissa_mask + 1) | (raw_value & mantissa_mask);
+        }
+
+        float_parts.exponent = exponent;
+
+        float_parts.mantissa.data = arena_alloc(&arena, 1 * sizeof(u32));
+        float_parts.mantissa.data[0] = mantissa;
+        float_parts.mantissa.size = 1;
     }
 
-    // Should be enough memory to convert any f32 float?
+    return float_format(float_parts, string, string_size, params, arena);
+}
+
+isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams const *params) {
+    FloatParts float_parts = {0};
+
+    // Should be enough memory to convert any f64 float?
     u8 arena_buffer[8 * 1024];
     Arena arena = {
         .begin = arena_buffer,
         .end = arena_buffer + 8 * 1024,
     };
 
-    return float_format(
-        (FloatParts){
-            is_negative,
-            exponent,
-            (Number){(u32[]){mantissa}, 1},
-        },
-        string, string_size,
-        params,
-        arena
-    );
-}
-
-isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams const *params) {
     u64 raw_value;
     memcpy(&raw_value, &value, sizeof(raw_value));
 
     bool is_negative = (raw_value & 0x8000000000000000) != 0;
     raw_value &= 0x7fffffffffffffff;
+    float_parts.is_negative = is_negative;
 
     // Mantissa size without an implicit 1.
     int const mantissa_bits = 52;
@@ -610,58 +848,37 @@ isize f64_format(f64 value, char *string, isize string_size, FloatFormatParams c
 
     // Handle infinities and NaNs.
     if (raw_exponent == 2047) {
-        StringWriter string_writer = {
-            .dest = string,
-            .dest_size = string_size,
-            .chars_written = 0,
-        };
-
         if ((raw_value & mantissa_mask) == 0) {
-            if (is_negative) {
-                string_writer_push_char(&string_writer, '-');
-            }
-            string_writer_push_string(&string_writer, SV(INFINITY_LITERAL));
+            float_parts.kind = FLOAT_KIND_INFINITY;
         } else {
-            string_writer_push_string(&string_writer, SV(NAN_LITERAL));
-        }
-        string_writer_push_char(&string_writer, '\0');
-
-        return string_writer.chars_written;
-    }
-
-    isize exponent;
-    u64 mantissa;
-    if (raw_exponent == 0) {
-        // Subnormals and zero.
-        exponent = -1022 - mantissa_bits;
-        mantissa = raw_value & mantissa_mask;
-
-        if (mantissa == 0) {
-            exponent = 0;
+            float_parts.kind = FLOAT_KIND_NAN;
         }
     } else {
-        // Normal floats.
-        exponent = raw_exponent - 1023 - mantissa_bits;
-        mantissa = (mantissa_mask + 1) | (raw_value & mantissa_mask);
+        isize exponent;
+        u64 mantissa;
+        if (raw_exponent == 0) {
+            // Subnormals and zero.
+            exponent = -1022 - mantissa_bits;
+            mantissa = raw_value & mantissa_mask;
+
+            if (mantissa == 0) {
+                exponent = 0;
+            }
+        } else {
+            // Normal floats.
+            exponent = raw_exponent - 1023 - mantissa_bits;
+            mantissa = (mantissa_mask + 1) | (raw_value & mantissa_mask);
+        }
+
+        float_parts.exponent = exponent;
+
+        float_parts.mantissa.data = arena_alloc(&arena, 2 * sizeof(u32));
+        float_parts.mantissa.data[0] = mantissa & 0xffffffff;
+        float_parts.mantissa.data[1] = mantissa >> 32;
+        float_parts.mantissa.size = 2;
     }
 
-    // Should be enough memory to convert any f64 float?
-    u8 arena_buffer[8 * 1024];
-    Arena arena = {
-        .begin = arena_buffer,
-        .end = arena_buffer + 8 * 1024,
-    };
-
-    return float_format(
-        (FloatParts){
-            is_negative,
-            exponent,
-            (Number){(u32[]){mantissa & 0xffffffff, mantissa >> 32}, 2},
-        },
-        string, string_size,
-        params,
-        arena
-    );
+    return float_format(float_parts, string, string_size, params, arena);
 }
 
 static inline bool char_is_digit(char value) {
@@ -802,48 +1019,56 @@ bool string_is_float(char const *string, isize string_size) {
     return float_literal_into_parts(string, string_size, &float_parts);
 }
 
-f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
-    FloatLiteralParts float_parts;
-    bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
+void float_parse(
+    char const *string, isize string_size,
+    isize max_mantissa_bits,
+    FloatParts *float_parts,
+    FloatLibAllocator *allocator
+) {
+    assert(float_parts->mantissa.size > 0);
+    assert(float_parts->mantissa.data != NULL);
+    assert(float_parts->mantissa.size * 32 >= max_mantissa_bits);
+
+    float_parts->kind = FLOAT_KIND_REGULAR;
+    float_parts->is_negative = false;
+    float_parts->exponent = 0;
+
+    FloatLiteralParts float_string_parts;
+    bool string_is_float = float_literal_into_parts(string, string_size, &float_string_parts);
     assert(string_is_float);
 
     if (
-        float_parts.special.size > 0 &&
-        strncmp(NAN_LITERAL, float_parts.special.data, float_parts.special.size) == 0
+        float_string_parts.special.size > 0 &&
+        strncmp(NAN_LITERAL, float_string_parts.special.data, float_string_parts.special.size) == 0
     ) {
-        return 0.0F / 0.0F;
+        float_parts->kind = FLOAT_KIND_NAN;
+        return;
     }
 
     if (
-        float_parts.special.size > 0 &&
-        strncmp(INFINITY_LITERAL, float_parts.special.data, float_parts.special.size) == 0
+        float_string_parts.special.size > 0 &&
+        strncmp(
+            INFINITY_LITERAL,
+            float_string_parts.special.data,
+            float_string_parts.special.size
+        ) == 0
     ) {
-        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
-            return -1.0F / 0.0F;
-        } else {
-            return 1.0F / 0.0F;
+        float_parts->kind = FLOAT_KIND_INFINITY;
+        if (float_string_parts.sign.size > 0 && float_string_parts.sign.data[0] == '-') {
+            float_parts->is_negative = true;
         }
+        return;
     }
 
+    bool decimal_exponent_underflow = false;
+    bool decimal_exponent_overflow = false;
     isize decimal_exponent = 0;
-    if (float_parts.exponent.size > 0) {
-        int decimal_exponent_sign = 1;
-
-        const char *decimal_exponent_iter = float_parts.exponent.data;
-        const char *decimal_exponent_end = float_parts.exponent.data + float_parts.exponent.size;
-
-        if (*decimal_exponent_iter == '-') {
-            decimal_exponent_sign = -1;
-            decimal_exponent_iter += 1;
-        }
-
-        // FIXME: Handle integer overflows.
-        while (decimal_exponent_iter < decimal_exponent_end) {
-            decimal_exponent = 10 * decimal_exponent + (*decimal_exponent_iter - '0');
-            decimal_exponent_iter += 1;
-        }
-
-        decimal_exponent *= decimal_exponent_sign;
+    if (float_string_parts.exponent.size > 0) {
+        decimal_exponent = isize_parse(
+            float_string_parts.exponent,
+            &decimal_exponent_overflow,
+            &decimal_exponent_underflow
+        );
     }
     assert(decimal_exponent >= 0 && "Not implemented");
 
@@ -858,7 +1083,7 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
         .size = 1,
     };
 
-    for (isize i = 0; i < float_parts.integer_part.size; i += 1) {
+    for (isize i = 0; i < float_string_parts.integer_part.size; i += 1) {
         {
             u32 overflow;
             number_multiply(mantissa, 10, mantissa_swap, &overflow);
@@ -874,7 +1099,12 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
 
         {
             u32 overflow;
-            number_add(mantissa_swap, float_parts.integer_part.data[i] - '0', mantissa, &overflow);
+            number_add(
+                mantissa_swap,
+                float_string_parts.integer_part.data[i] - '0',
+                mantissa,
+                &overflow
+            );
             if (overflow != 0) {
                 isize overflow_place = mantissa.size;
 
@@ -904,53 +1134,36 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     }
 
     if (number_is_zero(mantissa)) {
-        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
-            return -0.0F;
-        } else {
-            return 0.0F;
+        memset(float_parts->mantissa.data, 0, float_parts->mantissa.size * sizeof(u32));
+        if (float_string_parts.sign.size > 0 && float_string_parts.sign.data[0] == '-') {
+            float_parts->is_negative = true;
         }
+        return;
     }
 
-    // Mantissa size without an implicit 1.
-    int const ieee_mantissa_bits = 23;
-
-    u32 raw_mantissa;
     isize mantissa_bits;
     int rounding_bit = 0;
     for (isize i = mantissa.size - 1; i >= 0; i -= 1) {
         if (mantissa.data[i] != 0) {
             mantissa_bits = i * 32 + (32 - __builtin_clz(mantissa.data[i]));
 
-            int current_digit_bits = 32 - __builtin_clz(mantissa.data[i]);
-            int next_digit_bits = isize_max((ieee_mantissa_bits + 1) - current_digit_bits, 0);
+            bits_copy_nonoverlapping(
+                mantissa.data, isize_max(mantissa_bits - max_mantissa_bits, 0),
+                float_parts->mantissa.data, isize_max(max_mantissa_bits - mantissa_bits, 0),
+                isize_min(max_mantissa_bits, mantissa_bits)
+            );
+            bits_clear(
+                mantissa.data,
+                isize_max(mantissa_bits - max_mantissa_bits, 0),
+                isize_min(max_mantissa_bits, mantissa_bits)
+            );
 
-            int leftover_bits = isize_max(current_digit_bits - (ieee_mantissa_bits + 1), 0);
-            u32 digit_mask = 0xffffffff << leftover_bits;
-
-            raw_mantissa = (mantissa.data[i] & digit_mask) >> leftover_bits;
-            mantissa.data[i] = mantissa.data[i] & ~digit_mask;
-
-            if (leftover_bits > 0) {
-                u32 rounding_bit_mask = 1 << (leftover_bits - 1);
-                rounding_bit = (mantissa.data[i] & rounding_bit_mask) != 0;
-                mantissa.data[i] = mantissa.data[i] & ~rounding_bit_mask;
-            }
-
-            raw_mantissa <<= next_digit_bits;
-
-            if (i - 1 >= 0 && next_digit_bits > 0) {
-                int leftover_bits = 32 - next_digit_bits;
-                u32 digit_mask = 0xffffffff << leftover_bits;
-
-                raw_mantissa |= ((mantissa.data[i - 1] & digit_mask) >> leftover_bits);
-                mantissa.data[i - 1] = mantissa.data[i - 1] & ~digit_mask;
-
-                if (leftover_bits > 0) {
-                    u32 rounding_bit_mask = 1 << (leftover_bits - 1);
-                    rounding_bit = (mantissa.data[i - 1] & rounding_bit_mask) != 0;
-                    mantissa.data[i - 1] = mantissa.data[i - 1] & ~rounding_bit_mask;
-                }
-            }
+            isize rounding_bit_offset = isize_max(mantissa_bits - max_mantissa_bits, 0) - 1;
+            u32 rounding_bit_mask = (u32)1 << (rounding_bit_offset % 32);
+            rounding_bit = (mantissa.data[rounding_bit_offset / 32] & rounding_bit_mask) == 0
+                ? 0
+                : 1;
+            mantissa.data[rounding_bit_offset / 32] &= ~rounding_bit_mask;
 
             break;
         }
@@ -964,49 +1177,156 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
         }
     }
 
-    u32 raw_exponent = 127 + (mantissa_bits - 1);
+    float_parts->exponent = mantissa_bits - 1;
 
-    if (rounding_bit == 1 && sticky_bit == 1) {
-        raw_mantissa += 1;
+    if (
+        rounding_bit == 1 && sticky_bit == 1 ||
+        rounding_bit == 1 && sticky_bit == 0 && float_parts->mantissa.data[0] % 2 == 1
+    ) {
+        Number rounded_mantissa = {
+            .data = allocator->alloc(float_parts->mantissa.size * sizeof(u32), allocator->user_data),
+            .size = float_parts->mantissa.size,
+        };
+        memset(rounded_mantissa.data, 0, rounded_mantissa.size * sizeof(u32));
+        u32 rounded_mantissa_overflow = 0;
+
+        number_add(float_parts->mantissa, 1, rounded_mantissa, &rounded_mantissa_overflow);
+
+        if (rounded_mantissa_overflow == 0) {
+            isize leading_zeroes = 0;
+            for (isize i = rounded_mantissa.size - 1; i >= 0; i -= 1) {
+                if (rounded_mantissa.data[i] != 0) {
+                    leading_zeroes += __builtin_clz(rounded_mantissa.data[i]);
+                } else {
+                    leading_zeroes += 32;
+                }
+            }
+            if (32 * rounded_mantissa.size - leading_zeroes > max_mantissa_bits) {
+                bits_shift_right(rounded_mantissa.data, rounded_mantissa.size, 1);
+                float_parts->exponent += 1;
+            }
+        } else {
+            assert(rounded_mantissa_overflow == 1);
+
+            bits_shift_right(rounded_mantissa.data, rounded_mantissa.size, 1);
+            rounded_mantissa.data[rounded_mantissa.size - 1] |= 0x80000000;
+            float_parts->exponent += 1;
+        }
+
+        memcpy(
+            float_parts->mantissa.data,
+            rounded_mantissa.data,
+            float_parts->mantissa.size * sizeof(u32)
+        );
+        allocator->dealloc(
+            rounded_mantissa.data,
+            rounded_mantissa.size * sizeof(u32),
+            allocator->user_data
+        );
     }
-    if (rounding_bit == 1 && sticky_bit == 0 && raw_mantissa % 2 == 1) {
-        raw_mantissa += 1;
+
+    allocator->dealloc(mantissa.data, mantissa.size * sizeof(u32), allocator->user_data);
+    allocator->dealloc(mantissa_swap.data, mantissa_swap.size * sizeof(u32), allocator->user_data);
+}
+
+f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
+    // 23 bit is IEEE754 single-precision float mantissa size without an implicit one.
+    isize ieee_mantissa_bits = 23;
+
+    u32 mantissa_buffer[1] = {0};
+    FloatParts float_parts = {
+        .mantissa = {.data = mantissa_buffer, .size = 1},
+    };
+
+    // (ieee_mantissa_bits + 1) to include an implicit one.
+    float_parse(string, string_size, ieee_mantissa_bits + 1, &float_parts, allocator);
+
+    if (float_parts.kind == FLOAT_KIND_NAN) {
+        return 0.0F / 0.0F;
     }
-
-    if (raw_mantissa == 0x1000000) {
-        raw_mantissa >>= 1;
-        raw_exponent += 1;
-    }
-
-    u32 implicit_one_mask = ~((u32)1 << (32 - __builtin_clz(raw_mantissa) - 1));
-    raw_mantissa = raw_mantissa & implicit_one_mask;
-
-    if (raw_exponent >= 255) {
-        if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+    if (float_parts.kind == FLOAT_KIND_INFINITY) {
+        if (float_parts.is_negative) {
             return -1.0F / 0.0F;
         } else {
             return 1.0F / 0.0F;
         }
     }
 
+    u32 raw_mantissa = mantissa_buffer[0];
+    if (raw_mantissa == 0) {
+        return 0.0F;
+    }
+    u32 implicit_one_mask = ~((u32)1 << (32 - __builtin_clz(raw_mantissa) - 1));
+    raw_mantissa = raw_mantissa & implicit_one_mask;
+
+    // FIXME: Handle epxonent underflow here.
+    if (float_parts.exponent > 127) {
+        if (float_parts.is_negative) {
+            return -1.0F / 0.0F;
+        } else {
+            return 1.0F / 0.0F;
+        }
+    }
+    u32 raw_exponent = 127 + float_parts.exponent;
+
     u32 raw_sign = 0;
-    if (float_parts.sign.size > 0 && float_parts.sign.data[0] == '-') {
+    if (float_parts.is_negative) {
         raw_sign = 0x80000000;
     }
 
     u32 raw_value = raw_sign | raw_exponent << ieee_mantissa_bits | raw_mantissa;
-
     f32 value;
     memcpy(&value, &raw_value, sizeof(u32));
-
     return value;
 }
 
 f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
-    FloatLiteralParts float_parts;
-    bool string_is_float = float_literal_into_parts(string, string_size, &float_parts);
-    assert(string_is_float);
+    // 52 bit is IEEE754 double-precision float mantissa size without an implicit one.
+    isize ieee_mantissa_bits = 52;
 
-    assert(false && "Not implemented");
-    return 0.0;
+    u32 mantissa_buffer[2] = {0};
+    FloatParts float_parts = {
+        .mantissa = {.data = mantissa_buffer, .size = 2},
+    };
+
+    // (ieee_mantissa_bits + 1) to include an implicit one.
+    float_parse(string, string_size, ieee_mantissa_bits + 1, &float_parts, allocator);
+
+    if (float_parts.kind == FLOAT_KIND_NAN) {
+        return 0.0 / 0.0;
+    }
+    if (float_parts.kind == FLOAT_KIND_INFINITY) {
+        if (float_parts.is_negative) {
+            return -1.0 / 0.0;
+        } else {
+            return 1.0 / 0.0;
+        }
+    }
+
+    u64 raw_mantissa = (u64)mantissa_buffer[1] << 32 | (u64)mantissa_buffer[0];
+    if (raw_mantissa == 0) {
+        return 0.0;
+    }
+    u64 implicit_one_mask = ~((u64)1 << (64 - __builtin_clzll(raw_mantissa) - 1));
+    raw_mantissa = raw_mantissa & implicit_one_mask;
+
+    // FIXME: Handle epxonent underflow here.
+    if (float_parts.exponent > 1023) {
+        if (float_parts.is_negative) {
+            return -1.0 / 0.0;
+        } else {
+            return 1.0 / 0.0;
+        }
+    }
+    u64 raw_exponent = 1023 + float_parts.exponent;
+
+    u64 raw_sign = 0;
+    if (float_parts.is_negative) {
+        raw_sign = 0x8000000000000000;
+    }
+
+    u64 raw_value = raw_sign | raw_exponent << ieee_mantissa_bits | raw_mantissa;
+    f64 value;
+    memcpy(&value, &raw_value, sizeof(u64));
+    return value;
 }

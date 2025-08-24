@@ -58,6 +58,20 @@ void f32_test_parse(char const *string) {
     }
 }
 
+void f64_test_parse(char const *string) {
+    if (!string_is_float(string, -1)) {
+        printf("'%s' is not a float.\n", string);
+    } else {
+        f64 output = f64_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+        printf(
+            "%1.16e (via strtod: %1.16e) (%s)\n",
+            strtod(string, NULL),
+            output,
+            output == strtod(string, NULL) ? "OK" : "FAIL"
+        );
+    }
+}
+
 int main(void) {
     // f32 tests
 
@@ -124,6 +138,17 @@ int main(void) {
     f32_test_parse("33554431");
     f32_test_parse("12345e8");
     f32_test_parse("12345464e10323");
+
+    printf("\n");
+
+    f64_test_parse("0");
+    f64_test_parse("1");
+    f64_test_parse("123");
+    f64_test_parse("123e10");
+    f64_test_parse("33554431");
+    f64_test_parse("12345e8");
+    f64_test_parse("123456789123456789123e8");
+    f64_test_parse("12345464e10323");
 
     printf("\n");
 

@@ -1,7 +1,7 @@
 #include <stddef.h>     // NULL
 #include <assert.h>     // assert
 #include <stdio.h>      // printf
-#include <string.h>     // strlen, memcpy, memcmp, memmove
+#include <string.h>     // strlen, memcpy, memcmp, memmove, memset
 #include <ctype.h>      // isspace
 #include <stdbool.h>    // true, false, bool
 #include <stdlib.h>     // malloc, free
@@ -191,6 +191,63 @@ inline void bits_shift_right(u32 *words, isize word_count, isize shift) {
     bits_shift(words, word_count, -shift);
 }
 
+// Fill bit_count bits starting from starting_offset towards the more significant bits.
+void bits_fill(u32 *words, isize word_count, isize starting_offset, isize bit_count, int value) {
+    assert((starting_offset + bit_count) / 32 <= word_count);
+
+    if (bit_count > 0) {
+        u32 *first_word = &words[starting_offset / 32];
+
+        u32 mask = 0xffffffff;
+        mask >>= 32 - isize_min(bit_count, 32);
+        mask <<= starting_offset % 32;
+
+        if (value == 0) {
+            *first_word &= ~mask;
+        } else {
+            *first_word |= mask;
+        }
+
+        isize first_word_bits = 32 - starting_offset % 32;
+        bit_count -= first_word_bits;
+        starting_offset += first_word_bits;
+    }
+
+    assert(bit_count == 0 || starting_offset % 32 == 0);
+    if (bit_count / 32 > 0) {
+        u8 fill_value = value == 0 ? 0 : 0xff;
+        memset(words + starting_offset / 32, fill_value, (bit_count / 32) * sizeof(u32));
+
+        isize middle_bits = (bit_count / 32) * 32;
+        bit_count -= middle_bits;
+        starting_offset += middle_bits;
+    }
+
+    assert(bit_count == 0 || starting_offset % 32 == 0 && bit_count < 32);
+    if (bit_count > 0) {
+        u32 *last_word = &words[starting_offset / 32];
+
+        u32 mask = 0xffffffff;
+        mask >>= 32 - bit_count;
+
+        if (value == 0) {
+            *last_word &= ~mask;
+        } else {
+            *last_word |= mask;
+        }
+    }
+}
+
+inline void bits_set(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
+    bits_fill(words, word_count, starting_offset, bit_count, 1);
+}
+
+inline void bits_clear(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
+    bits_fill(words, word_count, starting_offset, bit_count, 0);
+}
+
+// Tests
+
 int test_count = 0;
 int tests_passed = 0;
 
@@ -211,30 +268,99 @@ void bits_shift_test(isize shift, char const *input_string, char const *expected
     char *expected_string_formatted = malloc(expected_string_formatted_size);
     bits_to_string(expected_words, expected_word_count, expected_string_formatted, expected_string_formatted_size);
 
-    u32 *shifted_words = malloc(input_word_count * sizeof(u32));
-    memcpy(shifted_words, input_words, input_word_count * sizeof(u32));
-    bits_shift(shifted_words, input_word_count, shift);
-    isize shifted_string_size = bits_to_string(shifted_words, input_word_count, NULL, 0);
-    char *shifted_string = malloc(shifted_string_size);
-    bits_to_string(shifted_words, input_word_count, shifted_string, shifted_string_size);
+    u32 *actual_words = malloc(input_word_count * sizeof(u32));
+    memcpy(actual_words, input_words, input_word_count * sizeof(u32));
+    bits_shift(actual_words, input_word_count, shift);
+    isize actual_string_size = bits_to_string(actual_words, input_word_count, NULL, 0);
+    char *actual_string = malloc(actual_string_size);
+    bits_to_string(actual_words, input_word_count, actual_string, actual_string_size);
 
-    if (memcmp(expected_words, shifted_words, expected_word_count * sizeof(u32)) == 0) {
+    if (memcmp(expected_words, actual_words, expected_word_count * sizeof(u32)) == 0) {
         tests_passed += 1;
     } else {
-        printf("Test failed\n");
+        printf("Test #%d failed\n", test_count);
         printf("in:\t%s\n", input_string_formatted);
         printf("shift:\t%td\n", shift);
         printf("Expected:\n\t%s\n", expected_string_formatted);
-        printf("Actual:\n\t%s\n\n", shifted_string);
+        printf("Actual:\n\t%s\n\n", actual_string);
     }
 
     free(input_words);
-    free(shifted_words);
+    free(actual_words);
     free(expected_words);
 
     free(input_string_formatted);
     free(expected_string_formatted);
-    free(shifted_string);
+    free(actual_string);
+}
+
+// "function" is either bits_clear or bits_set.
+void bits_fill_test(
+    isize starting_offset,
+    isize bit_count,
+    char const *input_string,
+    char const *expected_string,
+    void(*function)(u32 *, isize, isize, isize)
+) {
+    test_count += 1;
+
+    isize input_word_count = bits_from_string(input_string, -1, NULL, 0);
+    u32 *input_words = malloc(input_word_count * sizeof(u32));
+    bits_from_string(input_string, -1, input_words, input_word_count);
+    isize input_string_formatted_size = bits_to_string(input_words, input_word_count, NULL, 0);
+    char *input_string_formatted = malloc(input_string_formatted_size);
+    bits_to_string(input_words, input_word_count, input_string_formatted, input_string_formatted_size);
+
+    isize expected_word_count = bits_from_string(expected_string, -1, NULL, 0);
+    u32 *expected_words = malloc(expected_word_count * sizeof(u32));
+    bits_from_string(expected_string, -1, expected_words, expected_word_count);
+    isize expected_string_formatted_size = bits_to_string(expected_words, expected_word_count, NULL, 0);
+    char *expected_string_formatted = malloc(expected_string_formatted_size);
+    bits_to_string(expected_words, expected_word_count, expected_string_formatted, expected_string_formatted_size);
+
+    u32 *actual_words = malloc(input_word_count * sizeof(u32));
+    memcpy(actual_words, input_words, input_word_count * sizeof(u32));
+    function(actual_words, input_word_count, starting_offset, bit_count);
+    isize actual_string_size = bits_to_string(actual_words, input_word_count, NULL, 0);
+    char *actual_string = malloc(actual_string_size);
+    bits_to_string(actual_words, input_word_count, actual_string, actual_string_size);
+
+    if (memcmp(expected_words, actual_words, expected_word_count * sizeof(u32)) == 0) {
+        tests_passed += 1;
+    } else {
+        printf("Test #%d failed\n", test_count);
+        printf("in:\t%s\n", input_string_formatted);
+        printf("offset:\t%td\n", starting_offset);
+        printf("bits:\t%td\n", bit_count);
+        printf("Expected:\n\t%s\n", expected_string_formatted);
+        printf("Actual:\n\t%s\n\n", actual_string);
+    }
+
+    free(input_words);
+    free(actual_words);
+    free(expected_words);
+
+    free(input_string_formatted);
+    free(expected_string_formatted);
+    free(actual_string);
+}
+
+void bits_clear_test(
+    isize starting_offset,
+    isize bit_count,
+    char const *input_string,
+    char const *expected_string
+) {
+    bits_fill_test(starting_offset, bit_count, input_string, expected_string, bits_clear);
+}
+
+void bits_set_test(
+    isize starting_offset,
+    isize bit_count,
+    char const *input_string,
+    char const *expected_string
+) {
+    bits_fill_test(starting_offset, bit_count, input_string, expected_string, bits_set);
 }
 
 int main(void) {
@@ -320,6 +446,60 @@ int main(void) {
     bits_shift_test(-9223372036854775807ll - 1ll,
         "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    );
+
+    // bits_clear/bits_set tests
+
+    // Setting zero bits:
+    bits_set_test(0, 0,
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000"
+    );
+
+    // Setting whole words at aligned offsets:
+    bits_set_test(0, 32,
+        "00000000000000000000000000000000",
+        "11111111111111111111111111111111"
+    );
+    bits_set_test(32, 96,
+        "00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000",
+        "11111111111111111111111111111111 11111111111111111111111111111111 11111111111111111111111111111111 00000000000000000000000000000000"
+    );
+
+    // Setting bits starting at aligned offsets:
+    bits_set_test(0, 14,
+        "00000000000000000000000000000000",
+        "00000000000000000011111111111111"
+    );
+    bits_set_test(32, 24,
+        "00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000",
+        "00000000000000000000000000000000 00000000000000000000000000000000 00000000111111111111111111111111 00000000000000000000000000000000"
+    );
+    bits_set_test(32, 77,
+        "00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000 00000000000000000000000000000000",
+        "00000000000000000001111111111111 11111111111111111111111111111111 11111111111111111111111111111111 00000000000000000000000000000000"
+    );
+
+    // Setting bits starting at unaligned offsets:
+    bits_set_test(12, 17,
+        "00000000000000000000000000000000",
+        "00011111111111111111000000000000"
+    );
+    bits_set_test(25, 8,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000111111110000000000000000000000000"
+    );
+    bits_set_test(31, 35,
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000111111111111111111111111111111111110000000000000000000000000000000"
+    );
+    bits_set_test(12, 95,
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000011111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000"
+    );
+    bits_clear_test(24, 100,
+        "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "11110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000111111111111111111111111"
     );
 
     printf("%d/%d tests passed.\n", tests_passed, test_count);

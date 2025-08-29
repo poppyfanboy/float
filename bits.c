@@ -177,17 +177,12 @@ void bits_shift(u32 *words, isize word_count, isize shift) {
 }
 
 inline void bits_shift_left(u32 *words, isize word_count, isize shift) {
+    assert(shift >= 0);
     bits_shift(words, word_count, shift);
 }
 
 inline void bits_shift_right(u32 *words, isize word_count, isize shift) {
-    // NOTE: OCD
-    isize const isize_min = -(isize)((usize)(-1) >> 1) - 1;
-    if (shift == isize_min) {
-        bits_shift(words, word_count, -1);
-        shift += 1;
-    }
-
+    assert(shift >= 0);
     bits_shift(words, word_count, -shift);
 }
 
@@ -197,54 +192,42 @@ static inline void bits_fill(
     isize starting_offset, isize bit_count,
     int value
 ) {
-    // Basically (starting_offset + bit_count <= 32 * word_count) check but without overflows (?):
-    isize const min_word_count =
-        starting_offset / 32 +                              // whole words worth of starting offset
-        bit_count / 32 +                                    // whole words worth of bits
-        (starting_offset % 32 + bit_count % 32 + 31) / 32;  // remainders summed up and rounded up
-    assert(min_word_count <= word_count);
+    assert(starting_offset <= 32 * word_count - bit_count);
+
+    u32 *word_iter = &words[starting_offset / 32];
 
     if (bit_count > 0) {
-        u32 *first_word = &words[starting_offset / 32];
-
         u32 mask = 0xffffffff;
         mask >>= 32 - isize_min(bit_count, 32);
         mask <<= starting_offset % 32;
 
         if (value == 0) {
-            *first_word &= ~mask;
+            *word_iter &= ~mask;
         } else {
-            *first_word |= mask;
+            *word_iter |= mask;
         }
+        word_iter += 1;
 
         isize first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
         bit_count -= first_word_bits;
-        starting_offset += first_word_bits;
     }
 
-    assert(bit_count >= 0);
-    assert(bit_count == 0 || starting_offset % 32 == 0);
-    if (bit_count / 32 > 0) {
+    if (bit_count >= 32) {
         u8 fill_value = value == 0 ? 0 : 0xff;
-        memset(words + starting_offset / 32, fill_value, (bit_count / 32) * sizeof(u32));
+        memset(word_iter, fill_value, (bit_count / 32) * sizeof(u32));
 
-        isize middle_bits = (bit_count / 32) * 32;
-        bit_count -= middle_bits;
-        starting_offset += middle_bits;
+        word_iter += bit_count / 32;
+        bit_count %= 32;
     }
 
-    assert(bit_count >= 0);
-    assert(bit_count == 0 || starting_offset % 32 == 0 && bit_count < 32);
     if (bit_count > 0) {
-        u32 *last_word = &words[starting_offset / 32];
-
         u32 mask = 0xffffffff;
         mask >>= 32 - bit_count;
 
         if (value == 0) {
-            *last_word &= ~mask;
+            *word_iter &= ~mask;
         } else {
-            *last_word |= mask;
+            *word_iter |= mask;
         }
     }
 }
@@ -257,29 +240,30 @@ void bits_clear(u32 *words, isize word_count, isize starting_offset, isize bit_c
     bits_fill(words, word_count, starting_offset, bit_count, 0);
 }
 
+// Puts the result into the lower bits of the u32.
 static u32 bits_read(u32 *words, isize starting_offset, int bit_count) {
     assert(0 < bit_count && bit_count <= 32);
 
-    u32 *first_word = &words[starting_offset / 32];
-    int first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
-    u32 result = (*first_word >> (starting_offset % 32)) & (0xffffffff >> (32 - first_word_bits));
-
-    int second_word_bits = bit_count - first_word_bits;
-    if (second_word_bits > 0) {
-        u32 *second_word = first_word + 1;
-        result |= (*second_word & (0xffffffff >> (32 - second_word_bits))) << first_word_bits;
+    u64 source_data = words[starting_offset / 32];
+    if (starting_offset % 32 + bit_count > 32) {
+        // A clever trick could be applied here to make the code branchless, but I don't deserve it.
+        source_data |= (u64)words[starting_offset / 32 + 1] << 32;
     }
 
-    return result;
+    return (source_data >> starting_offset % 32) & (0xffffffffffffffff >> (64 - bit_count));
 }
 
 void bits_copy_nonoverlapping(
-    u32 *source_words, isize source_starting_offset,
-    u32 *dest_words, isize dest_starting_offset,
+    u32 *source_words, isize source_word_count, isize source_starting_offset,
+    u32 *dest_words, isize dest_word_count, isize dest_starting_offset,
     isize bit_count
 ) {
+    assert(source_starting_offset <= 32 * source_word_count - bit_count);
+    assert(dest_starting_offset <= 32 * dest_word_count - bit_count);
+
+    u32 *dest_iter = &dest_words[dest_starting_offset / 32];
+
     if (bit_count > 0) {
-        u32 *first_word = &dest_words[dest_starting_offset / 32];
         isize first_word_bits = isize_min(bit_count, 32 - dest_starting_offset % 32);
 
         u32 source_data = bits_read(source_words, source_starting_offset, first_word_bits);
@@ -287,38 +271,30 @@ void bits_copy_nonoverlapping(
         u32 dest_clear_mask = 0xffffffff;
         dest_clear_mask >>= 32 - isize_min(bit_count, 32);
         dest_clear_mask <<= dest_starting_offset % 32;
-        *first_word &= ~dest_clear_mask;
-        *first_word |= source_data << dest_starting_offset % 32;
+
+        *dest_iter &= ~dest_clear_mask;
+        *dest_iter |= source_data << dest_starting_offset % 32;
+        dest_iter += 1;
 
         source_starting_offset += first_word_bits;
-        dest_starting_offset += first_word_bits;
         bit_count -= first_word_bits;
     }
 
-    assert(bit_count >= 0);
-    assert(bit_count == 0 || dest_starting_offset % 32 == 0);
-    if (bit_count / 32 > 0) {
-        while (bit_count / 32 > 0) {
-            u32 *middle_word = &dest_words[dest_starting_offset / 32];
-            *middle_word = bits_read(source_words, source_starting_offset, 32);
+    while (bit_count >= 32) {
+        *(dest_iter++) = bits_read(source_words, source_starting_offset, 32);
 
-            source_starting_offset += 32;
-            dest_starting_offset += 32;
-            bit_count -= 32;
-        }
+        source_starting_offset += 32;
+        bit_count -= 32;
     }
 
-    assert(bit_count >= 0);
-    assert(bit_count == 0 || dest_starting_offset % 32 == 0 && bit_count < 32);
     if (bit_count > 0) {
-        u32 *last_word = &dest_words[dest_starting_offset / 32];
-
         u32 source_data = bits_read(source_words, source_starting_offset, bit_count);
 
         u32 dest_clear_mask = 0xffffffff;
         dest_clear_mask >>= 32 - bit_count;
-        *last_word &= ~dest_clear_mask;
-        *last_word |= source_data;
+
+        *dest_iter &= ~dest_clear_mask;
+        *dest_iter |= source_data;
     }
 }
 
@@ -451,8 +427,8 @@ void bits_copy_nonoverlapping_test(
     bits_to_string(expected_words, expected_word_count, expected_string_formatted, expected_string_formatted_size);
 
     bits_copy_nonoverlapping(
-        source_words, source_starting_offset,
-        dest_words, dest_starting_offset,
+        source_words, source_word_count, source_starting_offset,
+        dest_words, dest_word_count, dest_starting_offset,
         bit_count
     );
     isize actual_string_size = bits_to_string(dest_words, dest_word_count, NULL, 0);

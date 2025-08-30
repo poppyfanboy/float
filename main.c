@@ -45,31 +45,29 @@ void f64_print(f64 value, isize precision, bool exponential) {
 }
 
 void f32_test_parse(char const *string) {
-    if (!string_is_float(string, -1)) {
+    if (!string_represents_float(string, -1)) {
         printf("'%s' is not a float.\n", string);
     } else {
-        f32 output = f32_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+        f32 expected = strtof(string, NULL);
+        f32 actual = f32_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+
         printf(
             "%25s => %1.8e (via strtof: %1.8e) (%s)\n",
-            string,
-            output,
-            strtof(string, NULL),
-            output == strtof(string, NULL) ? "OK" : "FAIL"
+            string, actual, expected, actual == expected ? "OK" : "FAIL"
         );
     }
 }
 
 void f64_test_parse(char const *string) {
-    if (!string_is_float(string, -1)) {
+    if (!string_represents_float(string, -1)) {
         printf("'%s' is not a float.\n", string);
     } else {
-        f64 output = f64_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+        f64 expected = strtod(string, NULL);
+        f64 actual = f64_parse(string, -1, FLOAT_LIB_DEFAULT_ALLOCATOR);
+
         printf(
             "%25s => %1.16e (via strtod: %1.16e) (%s)\n",
-            string,
-            output,
-            strtod(string, NULL),
-            output == strtod(string, NULL) ? "OK" : "FAIL"
+            string, actual, expected, actual == expected ? "OK" : "FAIL"
         );
     }
 }

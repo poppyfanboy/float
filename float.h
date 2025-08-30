@@ -60,7 +60,7 @@ typedef struct {
 } FloatFormatParams;
 
 // You can pass -1 as string size in case the string is null-terminated.
-bool string_is_float(char const *string, isize string_size);
+bool string_represents_float(char const *string, isize string_size);
 f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator);
 f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator);
 

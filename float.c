@@ -10,7 +10,7 @@
 #include "float.h"
 
 #include <stddef.h> // NULL
-#include <string.h> // memcpy, memmove, memset, strncmp
+#include <string.h> // memcpy, memmove, memset, strncmp, strlen
 #include <assert.h> // assert
 
 #define LOG2_10 3.32192809488736234787
@@ -22,6 +22,73 @@ static inline isize isize_min(isize left, isize right) {
 static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
+
+static int u32_leading_zeroes_impl(u32 value) {
+    int leading_zeroes = 0;
+
+    if ((value & 0xffff0000) == 0) {
+        leading_zeroes += 16;
+        value <<= 16;
+    }
+    if ((value & 0xff000000) == 0) {
+        leading_zeroes += 8;
+        value <<= 8;
+    }
+    if ((value & 0xf0000000) == 0) {
+        leading_zeroes += 4;
+        value <<= 4;
+    }
+    if ((value & 0xc0000000) == 0) {
+        leading_zeroes += 2;
+        value <<= 2;
+    }
+    if ((value & 0x80000000) == 0) {
+        leading_zeroes += 1;
+    }
+
+    return leading_zeroes;
+}
+
+static int u64_leading_zeroes_impl(u64 value) {
+    int leading_zeroes = 0;
+
+    if ((value & 0xffffffff00000000) == 0) {
+        leading_zeroes += 32;
+        value <<= 32;
+    }
+    if ((value & 0xffff000000000000) == 0) {
+        leading_zeroes += 16;
+        value <<= 16;
+    }
+    if ((value & 0xff00000000000000) == 0) {
+        leading_zeroes += 8;
+        value <<= 8;
+    }
+    if ((value & 0xf000000000000000) == 0) {
+        leading_zeroes += 4;
+        value <<= 4;
+    }
+    if ((value & 0xc000000000000000) == 0) {
+        leading_zeroes += 2;
+        value <<= 2;
+    }
+    if ((value & 0x8000000000000000) == 0) {
+        leading_zeroes += 1;
+    }
+
+    return leading_zeroes;
+}
+
+#if defined(__GNUC__) || defined(__GNUG__)
+    #define u32_leading_zeroes __builtin_clz
+    #define u64_leading_zeroes __builtin_clzll
+#elif defined(_MSC_VER)
+    #define u32_leading_zeroes __lzcnt
+    #define u64_leading_zeroes __lzcnt64
+#else
+    #define u32_leading_zeroes u32_leading_zeroes_impl
+    #define u64_leading_zeroes u64_leading_zeroes_impl
+#endif
 
 static inline void *alloc(FloatLibAllocator *allocator, isize size) {
     return allocator->alloc(size, allocator->user_data);
@@ -72,7 +139,7 @@ typedef struct {
 } StringView;
 
 #define SV(string_literal)                  \
-    (StringView) {                          \
+    (StringView){                           \
         .data = string_literal,             \
         .size = sizeof(string_literal) - 1, \
     }
@@ -539,7 +606,7 @@ static void number_multiply_long(Number left, Number right, Number product) {
 
         for (isize left_index = 0; left_index < left.word_count; left_index += 1) {
             u64 intermediate_product =
-                (u64)left.words[right_index] * right.words[left_index] + carry;
+                (u64)left.words[left_index] * right.words[right_index] + carry;
             u64 intermediate_sum =
                 (intermediate_product & 0xffffffff) + (u64)product.words[right_index];
 
@@ -613,7 +680,7 @@ static void number_divide_long(
 
         // dividend size < divisor size <= remainder size, so the result will fit into remainder.
         memset(remainder.words, 0, remainder.word_count * sizeof(u32));
-        memcpy(remainder.words, dividend_input.words, dividend_input.word_count * sizeof(u32));
+        memcpy(remainder.words, dividend_input.words, remainder.word_count * sizeof(u32));
 
         return;
     }
@@ -643,7 +710,7 @@ static void number_divide_long(
     );
 
     isize normalization_shift =
-        __builtin_clz(divisor_normalized.words[divisor_normalized.word_count - 1]);
+        u32_leading_zeroes(divisor_normalized.words[divisor_normalized.word_count - 1]);
 
     bits_shift_left(dividend_normalized.words, dividend_normalized.word_count, normalization_shift);
     bits_shift_left(divisor_normalized.words, divisor_normalized.word_count, normalization_shift);
@@ -733,7 +800,7 @@ static isize number_leading_zeroes(Number number) {
         if (number.words[i] == 0) {
             leading_zeroes += 32;
         } else {
-            leading_zeroes += __builtin_clz(number.words[i]);
+            leading_zeroes += u32_leading_zeroes(number.words[i]);
             break;
         }
     }
@@ -1223,10 +1290,7 @@ static bool float_literal_into_parts(
     if (string_size >= 0) {
         string_end = string + string_size;
     } else {
-        string_end = string;
-        while (*string_end != '\0') {
-            string_end += 1;
-        }
+        string_end = string + strlen(string);
     }
 
     // Sign
@@ -1332,7 +1396,7 @@ bool string_represents_float(char const *string, isize string_size) {
 
 void float_parse(
     char const *string, isize string_size,
-    isize max_mantissa_bits,
+    isize max_mantissa_bits, isize min_exponent,
     FloatParts *float_parts,
     FloatLibAllocator *allocator
 ) {
@@ -1347,6 +1411,10 @@ void float_parse(
     bool string_is_float = float_literal_into_parts(string, string_size, &float_string_parts);
     assert(string_is_float);
 
+    if (float_string_parts.sign.size > 0 && float_string_parts.sign.data[0] == '-') {
+        float_parts->is_negative = true;
+    }
+
     if (sv_equals(float_string_parts.special, SV(NAN_LITERAL))) {
         float_parts->kind = FLOAT_KIND_NAN;
         return;
@@ -1354,9 +1422,6 @@ void float_parse(
 
     if (sv_equals(float_string_parts.special, SV(INFINITY_LITERAL))) {
         float_parts->kind = FLOAT_KIND_INFINITY;
-        if (float_string_parts.sign.size > 0 && float_string_parts.sign.data[0] == '-') {
-            float_parts->is_negative = true;
-        }
         return;
     }
 
@@ -1372,9 +1437,11 @@ void float_parse(
     }
     if (decimal_exponent_overflow) {
         float_parts->kind = FLOAT_KIND_INFINITY;
-        if (float_string_parts.sign.size > 0 && float_string_parts.sign.data[0] == '-') {
-            float_parts->is_negative = true;
-        }
+        return;
+    }
+    if (decimal_exponent_underflow) {
+        memset(float_parts->mantissa.words, 0, float_parts->mantissa.word_count * sizeof(u32));
+        float_parts->exponent = 0;
         return;
     }
 
@@ -1449,35 +1516,64 @@ void float_parse(
         }
 
         // 2^(max_mantissa_bits - 1)
-        Number min_bits = number_create_zero(((max_mantissa_bits - 1) + 31) / 32, allocator);
-        min_bits.words[(max_mantissa_bits - 1) / 32] = 1 << ((max_mantissa_bits - 1) % 32);
+        Number min_mantissa = number_create_zero(((max_mantissa_bits - 1) + 31) / 32, allocator);
+        min_mantissa.words[(max_mantissa_bits - 1) / 32] = 1 << ((max_mantissa_bits - 1) % 32);
 
-        Number min_mantissa = number_create_zero(
-            min_bits.word_count + denominator.word_count,
+        Number min_numerator = number_create_zero(
+            min_mantissa.word_count + denominator.word_count,
             allocator
         );
-        number_multiply_long(min_bits, denominator, min_mantissa);
+        number_multiply_long(min_mantissa, denominator, min_numerator);
 
         isize scaling_shift =
-            (32 * min_mantissa.word_count - number_leading_zeroes(min_mantissa)) -
+            (32 * min_numerator.word_count - number_leading_zeroes(min_numerator)) -
             (32 * mantissa.word_count - number_leading_zeroes(mantissa));
-        scaling_shift = isize_max(scaling_shift, 0);
+        scaling_shift = isize_min(isize_max(scaling_shift, 0), -min_exponent);
 
         // +1 to account for the potential additional shift in case we undershoot.
         number_resize(&mantissa, mantissa.word_count + (scaling_shift + 31 + 1) / 32, allocator);
 
         bits_shift_left(mantissa.words, mantissa.word_count, scaling_shift);
-        if (numbers_compare(mantissa, min_mantissa) < 0) {
+        if (numbers_compare(mantissa, min_numerator) < 0 && scaling_shift < -min_exponent) {
             bits_shift_left(mantissa.words, mantissa.word_count, 1);
+            scaling_shift += 1;
         }
 
         // After scaling mantissa up into the 2^(max_mantissa_bits - 1)..2^max_mantissa_bits what is
         // left is to divide the scaled mantissa by the 10^(-decimal_exponent).
 
-        number_destroy(denominator, allocator);
-        number_destroy(min_bits, allocator);
+        // +1, so that we don't overflow in case of rounding up.
+        Number quotient = number_create_zero(mantissa.word_count + 1, allocator);
+        Number remainder = number_create_zero(denominator.word_count, allocator);
+        number_divide_long(mantissa, denominator, quotient, remainder, allocator);
+
+        Number half_denominator = denominator;
+        number_divide(denominator, 2, half_denominator, NULL);
+
+        int rounding_direction = numbers_compare(remainder, half_denominator);
+        if (rounding_direction > 0 || rounding_direction == 0 && !number_is_even(quotient)) {
+            number_add(quotient, 1, quotient, NULL);
+
+            if (32 * quotient.word_count - number_leading_zeroes(quotient) > max_mantissa_bits) {
+                bits_shift_right(quotient.words, quotient.word_count, 1);
+                scaling_shift -= 1;
+            }
+        }
+
+        bits_copy_nonoverlapping(
+            quotient.words, 0,
+            float_parts->mantissa.words, 0,
+            max_mantissa_bits
+        );
+        float_parts->exponent = -scaling_shift;
+
+        number_destroy(remainder, allocator);
+        number_destroy(quotient, allocator);
+        number_destroy(min_numerator, allocator);
         number_destroy(min_mantissa, allocator);
-        assert(false && "Not implemented");
+        number_destroy(denominator, allocator);
+        number_destroy(mantissa, allocator);
+        return;
     }
 
     int rounding_bit = 0;
@@ -1507,7 +1603,7 @@ void float_parse(
         }
     }
 
-    float_parts->exponent = mantissa_bits - 1;
+    float_parts->exponent = mantissa_bits - max_mantissa_bits;
 
     if (
         rounding_bit == 1 && sticky_bit == 1 ||
@@ -1539,6 +1635,10 @@ void float_parse(
 }
 
 f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
+
+    isize const min_exponent = -126;
+    isize const max_exponent = 127;
+
     // 23 bit is IEEE 754 single-precision float mantissa size without an implicit one.
     isize ieee_mantissa_bits = 23;
 
@@ -1548,16 +1648,26 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     };
 
     // (ieee_mantissa_bits + 1) to include an implicit one.
-    float_parse(string, string_size, ieee_mantissa_bits + 1, &float_parts, allocator);
+    float_parse(
+        string, string_size,
+        ieee_mantissa_bits + 1, min_exponent - ieee_mantissa_bits,
+        &float_parts,
+        allocator
+    );
 
     if (float_parts.kind == FLOAT_KIND_NAN) {
-        return 0.0F / 0.0F;
+        f32 nan;
+        memcpy(&nan, &(u32){0x7f800001}, sizeof(u32));
+        return nan;
     }
     if (float_parts.kind == FLOAT_KIND_INFINITY) {
+        f32 infinity;
+        memcpy(&infinity, &(u32){0x7f800000}, sizeof(u32));
+
         if (float_parts.is_negative) {
-            return -1.0F / 0.0F;
+            return -infinity;
         } else {
-            return 1.0F / 0.0F;
+            return infinity;
         }
     }
 
@@ -1565,18 +1675,27 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     if (raw_mantissa == 0) {
         return 0.0F;
     }
-    u32 implicit_one_mask = ~((u32)1 << (32 - __builtin_clz(raw_mantissa) - 1));
-    raw_mantissa = raw_mantissa & implicit_one_mask;
 
-    // FIXME: Handle epxonent underflow here.
-    if (float_parts.exponent > 127) {
-        if (float_parts.is_negative) {
-            return -1.0F / 0.0F;
+    u32 const raw_exponent_bias = 127;
+    u32 raw_exponent;
+
+    // This puts the binary point right after the leftmost set bit.
+    isize exponent = float_parts.exponent + ieee_mantissa_bits;
+
+    if (exponent > max_exponent) {
+        raw_mantissa = 0;
+        raw_exponent = raw_exponent_bias + max_exponent + 1;
+    } else {
+        if (32 - u32_leading_zeroes(raw_mantissa) > ieee_mantissa_bits) {
+            u32 implicit_one_mask = ~((u32)1 << (32 - u32_leading_zeroes(raw_mantissa) - 1));
+            raw_mantissa = raw_mantissa & implicit_one_mask;
+            raw_exponent = raw_exponent_bias + exponent;
         } else {
-            return 1.0F / 0.0F;
+            raw_exponent = raw_exponent_bias + exponent - 1;
         }
     }
-    u32 raw_exponent = 127 + float_parts.exponent;
+
+    assert(32 - u32_leading_zeroes(raw_mantissa) <= ieee_mantissa_bits);
 
     u32 raw_sign = 0;
     if (float_parts.is_negative) {
@@ -1590,6 +1709,9 @@ f32 f32_parse(char const *string, isize string_size, FloatLibAllocator *allocato
 }
 
 f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocator) {
+    isize const min_exponent = -1022;
+    isize const max_exponent = 1023;
+
     // 52 bit is IEEE 754 double-precision float mantissa size without an implicit one.
     isize ieee_mantissa_bits = 52;
 
@@ -1599,16 +1721,27 @@ f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     };
 
     // (ieee_mantissa_bits + 1) to include an implicit one.
-    float_parse(string, string_size, ieee_mantissa_bits + 1, &float_parts, allocator);
+    float_parse(
+        string,
+        string_size,
+        ieee_mantissa_bits + 1, min_exponent - ieee_mantissa_bits,
+        &float_parts,
+        allocator
+    );
 
     if (float_parts.kind == FLOAT_KIND_NAN) {
-        return 0.0 / 0.0;
+        f64 nan;
+        memcpy(&nan, &(u64){0x7ff0000000000001}, sizeof(u64));
+        return nan;
     }
+
     if (float_parts.kind == FLOAT_KIND_INFINITY) {
+        f64 infinity;
+        memcpy(&infinity, &(u64){0x7ff0000000000000}, sizeof(u64));
         if (float_parts.is_negative) {
-            return -1.0 / 0.0;
+            return -infinity;
         } else {
-            return 1.0 / 0.0;
+            return infinity;
         }
     }
 
@@ -1616,18 +1749,27 @@ f64 f64_parse(char const *string, isize string_size, FloatLibAllocator *allocato
     if (raw_mantissa == 0) {
         return 0.0;
     }
-    u64 implicit_one_mask = ~((u64)1 << (64 - __builtin_clzll(raw_mantissa) - 1));
-    raw_mantissa = raw_mantissa & implicit_one_mask;
 
-    // FIXME: Handle epxonent underflow here.
-    if (float_parts.exponent > 1023) {
-        if (float_parts.is_negative) {
-            return -1.0 / 0.0;
+    u64 const raw_exponent_bias = 1023;
+    u64 raw_exponent;
+
+    // This puts the binary point right after the leftmost set bit.
+    isize exponent = float_parts.exponent + ieee_mantissa_bits;
+
+    if (exponent > max_exponent) {
+        raw_mantissa = 0;
+        raw_exponent = raw_exponent_bias + max_exponent + 1;
+    } else {
+        if (64 - u64_leading_zeroes(raw_mantissa) > ieee_mantissa_bits) {
+            u64 implicit_one_mask = ~((u64)1 << (64 - u64_leading_zeroes(raw_mantissa) - 1));
+            raw_mantissa = raw_mantissa & implicit_one_mask;
+            raw_exponent = raw_exponent_bias + exponent;
         } else {
-            return 1.0 / 0.0;
+            raw_exponent = raw_exponent_bias + exponent - 1;
         }
     }
-    u64 raw_exponent = 1023 + float_parts.exponent;
+
+    assert(64 - u64_leading_zeroes(raw_mantissa) <= ieee_mantissa_bits);
 
     u64 raw_sign = 0;
     if (float_parts.is_negative) {

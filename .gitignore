@@ -1,4 +1,10 @@
+# Ignore everything including the folders.
 *
 
+# Only keep the source code folders.
+!src/
+!test/
+
+# Only keep the source code files.
 !*.c
 !*.h

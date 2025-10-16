@@ -1,42 +1,11 @@
 #include <stddef.h>     // NULL
 #include <assert.h>     // assert
 #include <stdio.h>      // printf
-#include <string.h>     // strlen, memcpy, memcmp, memmove, memset
+#include <string.h>     // strlen, memcpy, memcmp
 #include <ctype.h>      // isspace
-#include <stdbool.h>    // true, false, bool
 #include <stdlib.h>     // malloc, free
 
-// Redefinition of typedefs is a C11 feature.
-// This is the official™ guard, which is used across different headers to protect u8 and friends.
-// (Or just add a #define before including this header, if you already have short names defined.)
-#ifndef SHORT_NAMES_FOR_PRIMITIVE_TYPES_WERE_DEFINED
-    #define SHORT_NAMES_FOR_PRIMITIVE_TYPES_WERE_DEFINED
-
-    #include <stdint.h>
-    #include <stddef.h>
-
-    typedef int8_t i8;
-    typedef uint8_t u8;
-    typedef uint16_t u16;
-    typedef int16_t i16;
-    typedef uint32_t u32;
-    typedef int32_t i32;
-    typedef uint64_t u64;
-    typedef int64_t i64;
-
-    typedef uintptr_t uptr;
-    typedef size_t usize;
-    typedef ptrdiff_t isize;
-
-    typedef float f32;
-    typedef double f64;
-#endif
-
-#define ARRAY_SIZE(array) ((isize)sizeof(array) / (isize)sizeof((array)[0]))
-
-static inline isize isize_min(isize left, isize right) {
-    return left < right ? left : right;
-}
+#include "../src/float.c"
 
 isize bits_to_string(
     u32 const *restrict words, isize word_count,
@@ -138,166 +107,6 @@ isize bits_from_string(
     return dest_word_count;
 }
 
-// Positive shifts are left shifts, because they shift bits into *more* significant places.
-void bits_shift(u32 *words, isize word_count, isize shift) {
-    if (shift >= 32 || shift <= -32) {
-        isize word_shift_amount = isize_min(shift > 0 ? shift / 32 : -(shift / 32), word_count);
-        isize word_copy_amount = word_count - word_shift_amount;
-
-        if (shift > 0) {
-            memmove(words + word_shift_amount, words, word_copy_amount * sizeof(u32));
-            memset(words, 0, word_shift_amount * sizeof(u32));
-        } else {
-            memmove(words, words + word_shift_amount, word_copy_amount * sizeof(u32));
-            memset(words + word_count - word_shift_amount, 0, word_shift_amount * sizeof(u32));
-        }
-    }
-
-    if (shift % 32 != 0) {
-        isize shift_amount = shift > 0 ? shift % 32 : -(shift % 32);
-
-        if (shift > 0) {
-            u32 overflow = 0;
-            for (isize i = 0; i < word_count; i += 1) {
-                u32 next_overflow = words[i] >> (32 - shift_amount);
-                words[i] = (words[i] << shift_amount) | overflow;
-
-                overflow = next_overflow;
-            }
-        } else {
-            u32 overflow = 0;
-            for (isize i = word_count - 1; i >= 0; i -= 1) {
-                u32 next_overflow = words[i] << (32 - shift_amount);
-                words[i] = (words[i] >> shift_amount) | overflow;
-
-                overflow = next_overflow;
-            }
-        }
-    }
-}
-
-inline void bits_shift_left(u32 *words, isize word_count, isize shift) {
-    assert(shift >= 0);
-    bits_shift(words, word_count, shift);
-}
-
-inline void bits_shift_right(u32 *words, isize word_count, isize shift) {
-    assert(shift >= 0);
-    bits_shift(words, word_count, -shift);
-}
-
-// Fill bit_count bits starting from starting_offset towards the more significant bits.
-static inline void bits_fill(
-    u32 *words, isize word_count,
-    isize starting_offset, isize bit_count,
-    int value
-) {
-    assert(starting_offset <= 32 * word_count - bit_count);
-
-    u32 *word_iter = &words[starting_offset / 32];
-
-    if (bit_count > 0) {
-        u32 mask = 0xffffffff;
-        mask >>= 32 - isize_min(bit_count, 32);
-        mask <<= starting_offset % 32;
-
-        if (value == 0) {
-            *word_iter &= ~mask;
-        } else {
-            *word_iter |= mask;
-        }
-        word_iter += 1;
-
-        isize first_word_bits = isize_min(bit_count, 32 - starting_offset % 32);
-        bit_count -= first_word_bits;
-    }
-
-    if (bit_count >= 32) {
-        u8 fill_value = value == 0 ? 0 : 0xff;
-        memset(word_iter, fill_value, (bit_count / 32) * sizeof(u32));
-
-        word_iter += bit_count / 32;
-        bit_count %= 32;
-    }
-
-    if (bit_count > 0) {
-        u32 mask = 0xffffffff;
-        mask >>= 32 - bit_count;
-
-        if (value == 0) {
-            *word_iter &= ~mask;
-        } else {
-            *word_iter |= mask;
-        }
-    }
-}
-
-void bits_set(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
-    bits_fill(words, word_count, starting_offset, bit_count, 1);
-}
-
-void bits_clear(u32 *words, isize word_count, isize starting_offset, isize bit_count) {
-    bits_fill(words, word_count, starting_offset, bit_count, 0);
-}
-
-// Puts the result into the lower bits of the u32.
-static u32 bits_read(u32 *words, isize starting_offset, int bit_count) {
-    assert(0 < bit_count && bit_count <= 32);
-
-    u64 source_data = words[starting_offset / 32];
-    if (starting_offset % 32 + bit_count > 32) {
-        // A clever trick could be applied here to make the code branchless, but I don't deserve it.
-        source_data |= (u64)words[starting_offset / 32 + 1] << 32;
-    }
-
-    return (source_data >> starting_offset % 32) & (0xffffffffffffffff >> (64 - bit_count));
-}
-
-void bits_copy_nonoverlapping(
-    u32 *source_words, isize source_word_count, isize source_starting_offset,
-    u32 *dest_words, isize dest_word_count, isize dest_starting_offset,
-    isize bit_count
-) {
-    assert(source_starting_offset <= 32 * source_word_count - bit_count);
-    assert(dest_starting_offset <= 32 * dest_word_count - bit_count);
-
-    u32 *dest_iter = &dest_words[dest_starting_offset / 32];
-
-    if (bit_count > 0) {
-        isize first_word_bits = isize_min(bit_count, 32 - dest_starting_offset % 32);
-
-        u32 source_data = bits_read(source_words, source_starting_offset, first_word_bits);
-
-        u32 dest_clear_mask = 0xffffffff;
-        dest_clear_mask >>= 32 - isize_min(bit_count, 32);
-        dest_clear_mask <<= dest_starting_offset % 32;
-
-        *dest_iter &= ~dest_clear_mask;
-        *dest_iter |= source_data << dest_starting_offset % 32;
-        dest_iter += 1;
-
-        source_starting_offset += first_word_bits;
-        bit_count -= first_word_bits;
-    }
-
-    while (bit_count >= 32) {
-        *(dest_iter++) = bits_read(source_words, source_starting_offset, 32);
-
-        source_starting_offset += 32;
-        bit_count -= 32;
-    }
-
-    if (bit_count > 0) {
-        u32 source_data = bits_read(source_words, source_starting_offset, bit_count);
-
-        u32 dest_clear_mask = 0xffffffff;
-        dest_clear_mask >>= 32 - bit_count;
-
-        *dest_iter &= ~dest_clear_mask;
-        *dest_iter |= source_data;
-    }
-}
-
 // Tests
 
 int test_count = 0;
@@ -352,7 +161,7 @@ void bits_fill_test(
     isize bit_count,
     char const *input_string,
     char const *expected_string,
-    void(*function)(u32 *, isize, isize, isize)
+    void(*function)(u32 *, isize, isize)
 ) {
     test_count += 1;
 
@@ -372,7 +181,7 @@ void bits_fill_test(
 
     u32 *actual_words = malloc(input_word_count * sizeof(u32));
     memcpy(actual_words, input_words, input_word_count * sizeof(u32));
-    function(actual_words, input_word_count, starting_offset, bit_count);
+    function(actual_words, starting_offset, bit_count);
     isize actual_string_size = bits_to_string(actual_words, input_word_count, NULL, 0);
     char *actual_string = malloc(actual_string_size);
     bits_to_string(actual_words, input_word_count, actual_string, actual_string_size);
@@ -427,8 +236,8 @@ void bits_copy_nonoverlapping_test(
     bits_to_string(expected_words, expected_word_count, expected_string_formatted, expected_string_formatted_size);
 
     bits_copy_nonoverlapping(
-        source_words, source_word_count, source_starting_offset,
-        dest_words, dest_word_count, dest_starting_offset,
+        source_words, source_starting_offset,
+        dest_words, dest_starting_offset,
         bit_count
     );
     isize actual_string_size = bits_to_string(dest_words, dest_word_count, NULL, 0);
